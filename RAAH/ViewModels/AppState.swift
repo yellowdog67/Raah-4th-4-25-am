@@ -791,16 +791,7 @@ final class AppState {
 
         // Share location with emergency contact
         if !emergencyContactPhone.isEmpty {
-            let coord = locationManager.effectiveLocation.coordinate
-            let mapsURL = "https://maps.apple.com/?ll=\(coord.latitude),\(coord.longitude)"
-            let address = contextPipeline.currentContext?.locationName
-                ?? "\(String(format: "%.5f", coord.latitude)), \(String(format: "%.5f", coord.longitude))"
-            let name = userName.isEmpty ? "Someone" : userName
-            let message = "\(name) has started Walk Me Home on RAAH. Tracking location:\n📍 \(address)\n🗺 \(mapsURL)"
-            let smsURL = "sms:\(emergencyContactPhone)?body=\(message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")"
-            if let url = URL(string: smsURL) {
-                UIApplication.shared.open(url)
-            }
+            sendSafetySMS(reason: "has started Walk Me Home and is being tracked")
         }
 
         // Start voice session if not already active

@@ -229,7 +229,7 @@ struct SettingsView: View {
         return GlassCard {
             VStack(spacing: 16) {
                 sectionTitle("SAFETY")
-                
+
                 GlassToggleRow(
                     "Safety Overlay",
                     subtitle: "Monitor area safety continuously",
@@ -237,13 +237,13 @@ struct SettingsView: View {
                     iconColor: .green,
                     isOn: $state.safetyOverlayEnabled
                 )
-                
+
                 Divider().opacity(0.2)
-                
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Emergency Contact")
                         .font(RAAHTheme.Typography.subheadline(.medium))
-                    
+
                     TextField("Contact name", text: $state.emergencyContactName)
                         .font(RAAHTheme.Typography.body())
                         .padding(12)
@@ -251,7 +251,7 @@ struct SettingsView: View {
                             RoundedRectangle(cornerRadius: RAAHTheme.Radius.sm, style: .continuous)
                                 .fill(Color.white.opacity(0.06))
                         }
-                    
+
                     TextField("Phone number", text: $state.emergencyContactPhone)
                         .font(RAAHTheme.Typography.body())
                         .keyboardType(.phonePad)
