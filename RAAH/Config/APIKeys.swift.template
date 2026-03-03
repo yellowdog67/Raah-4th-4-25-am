@@ -1,0 +1,44 @@
+import Foundation
+
+// Copy this file to APIKeys.swift and fill in your keys.
+// APIKeys.swift is gitignored — never commit real keys.
+
+enum APIKeys {
+
+    // 1. OPENAI  —  Required for voice
+    static let openAI = ""
+
+    // 2. SUPABASE  —  Long-term memory (pgvector)
+    static let supabaseURL = ""
+    static let supabaseAnonKey = ""
+
+    // 3. GOOGLE PLACES (New)  —  POI details, ratings, photos
+    static let googlePlaces = ""
+
+    // 4. MAPPLS (MapmyIndia)  —  India-specific mapping
+    static let mapplsAPIKey = ""
+    static let mapplsClientID = ""
+    static let mapplsClientSecret = ""
+
+    // 5. GETYOURGUIDE  —  Affiliate concierge
+    static let getYourGuidePartnerID = ""
+    static let getYourGuideAPIKey = ""
+
+    // 6. BRAVE SEARCH  —  Web search
+    static let braveSearch = ""
+
+    // 7. GEOSURE  —  Safety score data
+    static let geoSure = ""
+
+    // MARK: - Validation
+
+    static var isOpenAIConfigured: Bool { !openAI.isEmpty }
+    static var isSupabaseConfigured: Bool { !supabaseURL.isEmpty && !supabaseAnonKey.isEmpty }
+    static var isGooglePlacesConfigured: Bool { !googlePlaces.isEmpty }
+    static var isMapplsConfigured: Bool { !mapplsAPIKey.isEmpty }
+    static var isGetYourGuideConfigured: Bool { !getYourGuideAPIKey.isEmpty }
+    static var isBraveConfigured: Bool { !braveSearch.isEmpty }
+    static var isGeoSureConfigured: Bool { !geoSure.isEmpty }
+
+    static var hasRequiredKeys: Bool { isOpenAIConfigured }
+}

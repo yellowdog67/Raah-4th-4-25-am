@@ -1,0 +1,1165 @@
+================================================================================
+                    RAAH — COMPLETE MVP ANALYSIS REPORT
+                         March 2, 2026
+================================================================================
+
+TABLE OF CONTENTS
+  1. Executive Summary
+  2. Architecture Overview
+  3. Feature-by-Feature Analysis (24 Features + 6 Bonus)
+  4. Services & Infrastructure Audit
+  5. UI/UX Assessment
+  6. Known Issues & Bugs
+  7. What Stops a Perfect Demo
+  8. Recommendations
+  9. Appendix: File Map
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+RAAH is a voice-first AI travel companion for iOS. The user walks, taps an
+animated orb, and has a real-time voice conversation with an AI that knows
+nearby landmarks, restaurants, weather, and safety conditions.
+
+CODEBASE:
+  - 48 Swift files, ~15,000 lines
+  - iOS 17+, SwiftUI, @Observable pattern
+  - Zero third-party dependencies (pure Apple frameworks)
+  - Builds clean on Xcode with iOS 26.2 SDK
+
+ROADMAP COMPLETION:
+  - Sprint 1 "Make It Real" (6 items):      6/6 DONE
+  - Sprint 2 "Make It Smart" (7 items):      7/7 DONE
+  - Sprint 3 "Safe & Monetizable" (6 items): 6/6 DONE
+  - Bonus features not on roadmap:           6 additional
+  - TOTAL: 24/24 roadmap items + 6 extras = 30 features
+
+PRODUCTION READINESS:
+  - 22 features are demo-ready
+  - 3 features have critical bugs that need immediate fixes
+  - 5 features have medium-severity issues
+  - Estimated fix time for all blockers: ~4 hours
+
+
+================================================================================
+2. ARCHITECTURE OVERVIEW
+================================================================================
+
+DATA FLOW:
+  User speaks → LocationManager detects 100m movement →
+  ContextPipeline fetches in parallel (Overpass POIs + Wikipedia + Weather +
+  Safety + Affiliate) → SpatialCache returns cached, fetches misses →
+  ContextValidator self-heals gaps → SpatialContext built →
+  System prompt injected into OpenAI Realtime API → Voice response streamed →
+  Interaction stored in ShortTermMemory → At session end, LongTermMemory
+  extracts preferences via GPT-4o-mini
+
+KEY DESIGN DECISIONS:
+  - @Observable (iOS 17+) instead of ObservableObject
+  - AppState is single source of truth, owns all services
+  - JSON parsing uses JSONSerialization for API responses, Codable for persistence
+  - Combine only for location publisher; everything else is async/await
+  - Cache-first strategy: POIs 7d, Wikipedia 30d, Weather 1h, Geocode 7d
+  - Graceful degradation: every feature works without optional API keys
+
+REQUIRED API KEY:
+  - OpenAI (stored in UserDefaults via Settings)
+
+OPTIONAL API KEYS (features degrade gracefully without):
+  - Supabase (cloud memory sync)
+  - Google Places (enhanced food POIs)
+  - Mappls (India-specific features)
+  - GetYourGuide (skip-the-line tickets)
+  - Brave Search (web knowledge)
+  - GeoSure (safety scoring)
+
+
+================================================================================
+3. FEATURE-BY-FEATURE ANALYSIS
+================================================================================
+
+Each feature is rated on:
+  IMPLEMENTATION: How complete is the code?
+  RELIABILITY:    Will it work consistently during a demo?
+  SCALE:          How well does it handle edge cases?
+  ISSUES:         Known problems
+
+--------------------------------------------------------------------------------
+FEATURE 1: Real-Time Voice Conversation
+--------------------------------------------------------------------------------
+WHAT: Full-duplex WebSocket connection to OpenAI Realtime API. User speaks,
+      AI responds with voice. Bidirectional audio streaming.
+
+HOW:  OpenAIRealtimeService.swift manages WebSocket to
+      wss://api.openai.com/v1/realtime. Audio captured at hardware rate,
+      converted to 24kHz PCM16 mono via AVAudioConverter. Playback resampled
+      from 24kHz to hardware rate (usually 48kHz). Server-side VAD with
+      threshold 0.5, 300ms prefix padding, 500ms silence duration.
+
+WHY:  This IS the product. Voice-first means the conversation must feel
+      instantaneous and natural.
+
+SCALE: Handles AirPods connect/disconnect, speaker switching, audio
+       interruptions (phone calls). Echo suppression via suppressMicInput
+       flag prevents feedback loops.
+
+IMPLEMENTATION: 10/10
+RELIABILITY:    8/10
+ISSUES:
+  - Model ID is "gpt-4o-mini-realtime-preview-2024-12-17" — 15 months old,
+    deprecation risk. Should update to latest stable model.
+  - Voice hardcoded to "alloy" — no user choice.
+  - No guard against calling startVoiceSession() twice simultaneously.
+
+--------------------------------------------------------------------------------
+FEATURE 2: Spatial Context Pipeline
+--------------------------------------------------------------------------------
+WHAT: On significant movement (>100m), fetches nearby POIs, weather, safety,
+      affiliate offers, and Wikipedia enrichment in parallel. Builds a rich
+      context payload injected into the AI's system prompt.
+
+HOW:  ContextPipeline.swift binds to LocationManager's significantMovement-
+      Publisher (debounced 2s). Uses async let for parallel fetching.
+      SpatialCache returns cached data first, only fetches misses. Top 5
+      POIs enriched with Wikipedia summaries via TaskGroup. ContextValidator
+      auto-repairs incomplete data (missing timezone, location name, etc.).
+
+WHY:  Makes the AI spatially aware. Without this, RAAH is just a voice
+      chatbot. With this, it knows what's around you.
+
+SCALE: Handles: no internet (uses cache), slow APIs (parallel + timeout),
+       missing data (auto-repair), poor GPS (filters stale/inaccurate).
+       Cache hit rates tracked for optimization.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - CRITICAL: Demo POI fallback. If Overpass returns <4 POIs AND user is
+    near Goa (lat 15.2-15.6, lon 73.7-74.0), 6 hardcoded fake restaurants
+    are injected (Cafe Bodega, Burger Factory, Martin's Corner, etc.). These
+    will appear as real POIs during a demo in Goa. Outside Goa, this fallback
+    doesn't trigger, so POI count may be low in sparse areas.
+  - No circuit breaker on individual API failures.
+
+--------------------------------------------------------------------------------
+FEATURE 3: Proactive Narration
+--------------------------------------------------------------------------------
+WHAT: AI spontaneously mentions interesting places as you walk past them,
+      weighted by your preferences. "Notice that building ahead? That's the
+      Basilica of Bom Jesus, a UNESCO World Heritage Site from 1605..."
+
+HOW:  When ContextPipeline refreshes, AppState.checkForProactiveNarration()
+      filters nearby POIs: must be notable type (heritage, museum, monument,
+      architectural, religious, naturalFeature), within 80m, not already
+      mentioned. Candidates scored: preference_match * 0.6 + proximity * 0.4.
+      Best candidate's name + Wikipedia summary sent to AI as a text message.
+      Rate limited: max 1 per 120 seconds.
+
+WHY:  This is the differentiator. Doc 1's thesis: "proactively weaving a
+      narrative based on movement." Without proactive narration, RAAH is
+      reactive. With it, RAAH is a companion.
+
+SCALE: Handles: no nearby POIs (no trigger), all POIs already mentioned
+       (no trigger), user mid-conversation (waits for idle/paused state),
+       rapid movement (120s cooldown prevents spam).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    7/10
+ISSUES:
+  - Can interrupt natural conversation flow. If AI just finished speaking
+    and new context arrives, narration fires immediately. Should queue
+    narrations and wait for 3+ seconds of idle.
+  - voiceState guard allows .paused, which means narration triggers even
+    when user has been idle for 10+ seconds. This is intentional but may
+    feel jarring (mic suddenly reactivates to announce something).
+
+--------------------------------------------------------------------------------
+FEATURE 4: Turn-by-Turn Walking Navigation
+--------------------------------------------------------------------------------
+WHAT: "Take me to India Gate" → AI gives step-by-step walking directions.
+      Full-screen map with blue polyline, turn markers, camera follow, live
+      step progression.
+
+HOW:  DirectionsService.swift tries OSRM (free, global, pedestrian-
+      optimized) first, falls back to MKDirections walking, then transit.
+      Returns structured NavigationStep objects with instruction, distance,
+      coordinate. AppState.startNavigation() sets up state, pushes system
+      prompt telling AI to give only current step. checkNavigationProgress()
+      runs every 3s via location publisher, uses dual-condition advancement:
+      user must have walked >= max(50% of step distance, 25m) FROM where
+      step was announced AND be within 25m OF the waypoint.
+
+      NavigationMapView.swift shows: MapPolyline (blue, 5pt), UserAnnotation,
+      turn markers (green=completed, blue=current, white=upcoming), red
+      destination pin. 3D camera follows user heading at 500m distance, 45°
+      pitch. Bottom card shows current instruction with direction icon,
+      distance in meters, step counter.
+
+WHY:  Practical utility. "How do I get there?" is one of the most common
+      travel questions. Having it built-in with progressive voice guidance
+      means users never leave the app.
+
+SCALE: Handles: GPS jitter (dual condition prevents false advances), fast
+       walking (distance threshold scales with step length), API failure
+       (retries once, then falls back to distance-only result with explicit
+       instruction to AI not to hallucinate directions).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    7/10
+ISSUES:
+  - No off-route detection. If user walks the wrong way, navigation
+    silently waits forever. No "you seem to have gone off course" warning.
+  - No re-routing capability.
+  - Bottom card doesn't show ETA or remaining distance.
+  - Turn markers are small (14px) — hard to see at realistic zoom.
+
+--------------------------------------------------------------------------------
+FEATURE 5: Temporal Awareness
+--------------------------------------------------------------------------------
+WHAT: AI never recommends closed places, doesn't suggest food right after
+      eating, adapts suggestions to time of day.
+
+HOW:  OpeningHoursChecker (Models.swift) parses OSM opening_hours format
+      (supports Mo-Fr ranges, comma days, time ranges, 24/7, lunch breaks,
+      overnight, wrap-around). Returns: OPEN NOW, CLOSED, CLOSES SOON,
+      CLOSED TODAY. ContextPipeline.buildSystemPrompt() injects:
+      - CLOSED places: never recommend, suggest open alternative
+      - CLOSES SOON: warn user
+      - 90-minute food spam threshold
+      - 45-minute sightseeing/shopping repeat threshold
+      - Time-of-day rules (7 time bands from pre-7AM to post-10PM)
+      - Activity recency detection scans last 3 hours of conversations
+        for food/sightseeing/shopping keywords with timestamps
+
+WHY:  Recommending a closed restaurant destroys credibility. Time awareness
+      makes RAAH feel genuinely intelligent, not just a Wikipedia reader.
+
+SCALE: Handles: missing opening hours (shows raw string), Sunday closures,
+       overnight hours, multiple time ranges per day.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - Opening hours parser handles most OSM formats but may miss unusual
+    patterns (e.g., "PH off" for public holidays, seasonal hours).
+  - Activity recency uses keyword matching, not semantic understanding.
+    "I don't want food" would still trigger the food-recently-discussed flag.
+
+--------------------------------------------------------------------------------
+FEATURE 6: Safety System (Heuristic + GeoSure)
+--------------------------------------------------------------------------------
+WHAT: Evaluates location safety. Shows safety overlay with alerts, action
+      buttons (Walk Me Home, SOS, Share Location).
+
+HOW:  SafetyScoreService.swift tries GeoSure API first (if configured),
+      falls back to heuristic scoring: nighttime (21:00-06:00) = moderate,
+      thunderstorm weather = escalated. Safety levels: safe, moderate,
+      caution, danger. SafetyOverlaySheet shows level with icon, description,
+      and action buttons.
+
+WHY:  54.6% of solo travelers are female, 70% cite safety as #1 concern.
+      Safety is RAAH's brand differentiator.
+
+SCALE: Works without GeoSure API (heuristic fallback). Weather-based
+       alerts pull from Open-Meteo (free, no key).
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    7/10
+ISSUES:
+  - CRITICAL: Safety alert condition is inverted. check_safety_score tool
+    handler shows alert only when voice is DISCONNECTED:
+    `if report.level < .safe && !realtimeService.isConnected`
+    During active voice session (when user needs it most), alert suppressed.
+  - SafetyOverlaySheet has no loading state while evaluating. If API is
+    slow, sheet shows stale data.
+  - Heuristic night window (21:00-06:00) is hardcoded, not sunset-based.
+
+--------------------------------------------------------------------------------
+FEATURE 7: Walk Me Home Mode
+--------------------------------------------------------------------------------
+WHAT: Safety companion. AI stays active, checks in every 3 minutes. If user
+      doesn't respond to 2 consecutive check-ins (6+ min silence), auto-sends
+      emergency SMS with location.
+
+HOW:  AppState.activateWalkMeHome() sets state, sends SMS to emergency
+      contact with Apple Maps link, starts/ensures voice session, updates
+      system prompt to "watchful companion" tone, starts 3-minute timer.
+      performCheckIn() tracks time since last user response. If 2+ missed,
+      calls sendEmergencySMS(). Visual indicator: green shield on HomeView.
+
+WHY:  Nobody else has this. It's the demo moment that makes investors
+      lean forward.
+
+SCALE: Handles: no voice session (starts one), user responds (resets
+       counter), user says "I'm home" (AI calls deactivate tool).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    7/10
+ISSUES:
+  - SMS open via UIApplication.shared.open() doesn't confirm user actually
+    sent it. System assumes location was shared even if dialog dismissed.
+  - No rate limiting on emergency SMS. GPS jitter could theoretically
+    trigger multiple alerts.
+  - Check-in response detection relies on transcript update callback.
+    If user speaks but transcript fails to process, counter won't reset.
+
+--------------------------------------------------------------------------------
+FEATURE 8: Quick SOS
+--------------------------------------------------------------------------------
+WHAT: Triple-tap the orb → 3-second countdown → emergency SMS to saved
+      contact with current location.
+
+HOW:  AppState.triggerSOS() validates emergency contact exists, starts
+      countdown task (3→2→1), then calls sendSOSMessage() which opens
+      SMS with "SOS from RAAH: [User] triggered an emergency alert.
+      Location: [Apple Maps link]. Time: [now]". 3x heavy haptic burst
+      on activation. If voice active, AI confirms "Emergency alert sent
+      to [contact]".
+
+WHY:  Table stakes for safety-focused travel app. Under-2-second emergency
+      access without menu fumbling.
+
+SCALE: Handles: no emergency contact (button hidden, SOS guard returns),
+       voice active (AI confirms), countdown cancel (cancelSOS()).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - If emergency contact phone is empty, triple-tap does nothing with
+    no feedback. User doesn't know why SOS didn't work.
+
+--------------------------------------------------------------------------------
+FEATURE 9: Snap & Ask (Camera Vision)
+--------------------------------------------------------------------------------
+WHAT: Point camera at anything → AI identifies and describes it. "That's
+      the Church of Our Lady of the Immaculate Conception, built in 1541..."
+
+HOW:  SnapAndAskView.swift implements full AVCaptureSession with camera
+      preview. Capture → JPEG at 0.7 quality → base64 encode → send to
+      GPT-4o Vision API → display result. "Hear this aloud" speaks via
+      voice session or device TTS. "Ask more" sends follow-up with image
+      context.
+
+WHY:  Magic demo moment. "What is this building?" with instant expert
+      response creates wow factor.
+
+SCALE: Handles: camera denied (Settings redirect), analysis failure (error
+       message), daily limit (upgrade prompt), follow-up questions.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - Camera startup shows "Starting camera..." with no timeout. If camera
+    never initializes, user is stuck.
+  - Analysis failure shows raw error.localizedDescription to user.
+  - Confidence always returns "high" (not actually measured).
+
+--------------------------------------------------------------------------------
+FEATURE 10: Onboarding with Real Permissions
+--------------------------------------------------------------------------------
+WHAT: 5-page first-run flow: Welcome → Name → Interests + Dietary →
+      Theme + Orb Style → Permissions.
+
+HOW:  OnboardingView.swift uses TabView with 5 pages. Page 3 has 2-column
+      grids for interest categories (9 options) and dietary restrictions
+      (5 options). Page 4 shows accent color buttons and orb style cards
+      with live preview. Page 5 triggers real system permission dialogs for
+      location, microphone, camera, and HealthKit. Status updates in
+      real-time (checkmark/denied/allow button).
+
+WHY:  Nothing works without permissions. Clean onboarding sets the tone
+      and collects user profile data for personalization.
+
+SCALE: Handles: permission already granted (shows checkmark), permission
+       denied (redirects to Settings), HealthKit unavailable (shows disabled).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - No back button. User can't go to previous pages to fix mistakes
+    without restarting onboarding.
+  - Progress dots show current page but visual suggests all are "complete"
+    before reaching them.
+  - Permission status check may not reflect actual iOS state if user
+    changed permissions externally via Settings app.
+
+--------------------------------------------------------------------------------
+FEATURE 11: Weather-Aware Suggestions
+--------------------------------------------------------------------------------
+WHAT: AI adapts recommendations based on current weather, temperature,
+      visibility, and sunset timing.
+
+HOW:  WeatherService.swift fetches from Open-Meteo (free, no API key):
+      current temp, humidity, wind, visibility, weather code, sunrise/sunset,
+      7-day forecast. ContextPipeline injects rules:
+      - Raining: suggest indoor, warn against viewpoints
+      - Low visibility: no sunset/sunrise viewpoints
+      - Temp > 38°C: shaded venues, AC restaurants, water stops
+      - Sunset within 60 min + near viewpoint: proactively mention
+      - Hot/cold food: hot soup cold days, cold drinks hot days
+
+WHY:  Prevents embarrassing suggestions ("go watch the sunset" in a
+      thunderstorm). Essentially free to implement.
+
+SCALE: 7-day forecast enables forward planning ("Will it rain tomorrow?").
+       WMO weather codes mapped to 12 human-readable categories.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    9/10
+ISSUES:
+  - None significant. Open-Meteo is reliable and free.
+
+--------------------------------------------------------------------------------
+FEATURE 12: Dietary Restrictions
+--------------------------------------------------------------------------------
+WHAT: User's dietary preferences (Vegetarian, Vegan, Halal, Kosher,
+      Gluten-free) are respected in all food recommendations.
+
+HOW:  Selected during onboarding (page 3) and editable in Settings via
+      tappable chips. Stored as comma-separated string in AppState
+      (profile-scoped UserDefaults). Injected into system prompt as:
+      "DIETARY RESTRICTIONS: [value]. NEVER suggest food/restaurants that
+      violate these." Also stored as high-confidence (0.9) UserPreference
+      in LongTermMemory.
+
+WHY:  Recommending a steakhouse to a vegetarian is an instant trust-breaker.
+      This is table stakes for a food-aware travel app.
+
+SCALE: Settings UI allows post-onboarding editing. Synced to AI prompt
+       on every session.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    9/10
+ISSUES:
+  - Stored as comma-separated string. Edge case: if somehow corrupted
+    (extra commas, whitespace), parsing may produce empty entries.
+    Unlikely but not validated.
+
+--------------------------------------------------------------------------------
+FEATURE 13: Tiered Caching Layer
+--------------------------------------------------------------------------------
+WHAT: Local geohash-indexed cache reduces API calls by 60-80%.
+
+HOW:  SpatialCache.swift implements tiered caching in app's Caches directory:
+      - POIs: 7-day TTL, indexed by geohash precision 6 (~1.2km cells)
+      - Wikipedia summaries: 30-day TTL, indexed by POI ID
+      - Weather: 1-hour TTL, indexed by rounded coordinate
+      - Geocode: 7-day TTL, indexed by rounded coordinate
+      Thread-safe via DispatchQueue. Atomic writes. Tracks hit/miss ratio.
+
+WHY:  Walking back through an area visited 10 minutes ago shouldn't
+      re-fetch everything. Caching makes RAAH fast and cheap to operate.
+
+SCALE: Handles: cache miss (fetches fresh), cache expiry (TTL check),
+       concurrent access (dispatch queue), disk persistence (JSON files).
+
+IMPLEMENTATION: 10/10
+RELIABILITY:    9/10
+ISSUES:
+  - No cache size limit. Over weeks of use, cache files could grow large.
+    No eviction strategy beyond TTL expiry.
+
+--------------------------------------------------------------------------------
+FEATURE 14: Web Search for Local Knowledge
+--------------------------------------------------------------------------------
+WHAT: "Where's the best samosa near me?" → AI searches Reddit, TripAdvisor,
+      Google Maps via Brave Search, summarizes results conversationally.
+
+HOW:  WebSearchService.swift wraps Brave Search API (free tier: 2000
+      queries/month). Tool call search_local_knowledge defined in
+      OpenAIRealtimeService. Query augmented with location name and site
+      filters (reddit.com, tripadvisor.com, google.com/maps). Returns
+      top 3 results with titles and snippets for AI to summarize.
+
+WHY:  Overpass and Wikipedia can't answer "best X" questions. The knowledge
+      lives on Reddit and food blogs. This makes RAAH feel like a real
+      local friend.
+
+SCALE: Handles: API not configured (returns helpful message), no results
+       (returns "no results found"), network error (returns empty).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - Requires Brave Search API key to function. Without it, returns
+    "Web search is not configured" message.
+  - Site filters hardcoded to 3 sites. Could miss valuable local blogs
+    or Yelp results.
+
+--------------------------------------------------------------------------------
+FEATURE 15: Post-Activity Feedback
+--------------------------------------------------------------------------------
+WHAT: After visiting a POI for 10+ minutes and leaving, AI asks "So how
+      was [place]? Worth the visit?" Response stored as high-confidence
+      preference.
+
+HOW:  AppState.trackNearbyDwell() creates DwellEntry for notable POIs
+      within 150m. checkForFeedbackOpportunity() checks: dwell time >= 10
+      minutes AND user now >300m away. If triggered, sends feedback question
+      to AI. Response parsed and stored as 0.9 confidence UserPreference.
+      Rate limited: max 1 feedback request per 15 minutes.
+
+WHY:  Explicit feedback gives 0.9+ confidence vs 0.5-0.7 from inferred
+      preferences. Builds high-quality taste profiles.
+
+SCALE: Handles: user never visits (no trigger), quick visits <10 min
+       (no trigger), multiple POIs (tracks each separately), rapid
+       departures (300m threshold prevents premature triggers).
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    7/10
+ISSUES:
+  - Dwell tracker grows unbounded during a session. No cleanup for POIs
+    the user walked past but never visited (stays <10 min).
+  - Feedback parsing relies on AI interpretation, not structured response.
+
+--------------------------------------------------------------------------------
+FEATURE 16: Inference Cost Throttling
+--------------------------------------------------------------------------------
+WHAT: Pauses audio streaming when user is silent for 10+ seconds. Saves
+      60-70% of API costs during idle walking.
+
+HOW:  OpenAIRealtimeService starts idle timer on every response.done and
+      response.cancelled event. After 10 seconds of no speech detected,
+      pauses audio capture and sets voiceState to .paused. Resumes on:
+      user taps mic button, proactive narration triggers, or Walk Me Home
+      check-in fires. Also clears audio buffer on pause.
+
+WHY:  OpenAI Realtime API costs ~$9/hour/user. Pausing during silence
+      makes the unit economics viable.
+
+SCALE: Handles: user resumes speaking (speech_started cancels timer),
+       proactive narration (resumes capture before sending), system
+       events (check-ins resume capture).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    9/10
+ISSUES:
+  - None significant. Timer-based approach is simple and reliable.
+
+--------------------------------------------------------------------------------
+FEATURE 17: Battery Optimization
+--------------------------------------------------------------------------------
+WHAT: GPS accuracy adapts to session state. High accuracy during voice
+      (10m filter), navigation (5m filter), low accuracy when idle (50m
+      filter). Heading updates paused when not on Explore tab.
+
+HOW:  LocationManager.setHighAccuracy(), setNavigationAccuracy(),
+      setLowAccuracy() methods called by AppState on session start/end
+      and navigation start/end. ContentView pauses heading on tab change.
+
+WHY:  GPS at full accuracy drains battery in 2 hours. Adaptive accuracy
+      extends battery life significantly.
+
+SCALE: Three accuracy modes properly managed across all app states.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    9/10
+ISSUES:
+  - None significant.
+
+--------------------------------------------------------------------------------
+FEATURE 18: Exploration Journal
+--------------------------------------------------------------------------------
+WHAT: Automatic trip history. Each voice session logged with duration,
+      POIs visited, interaction count, weather, start/end coordinates.
+
+HOW:  ExplorationLogger.swift auto-creates ExplorationLog on session start,
+      finalizes on session end with duration and final stats. Persists as
+      JSON array in Documents directory. JournalView shows glass cards with
+      date, location, stats. Detail view shows map with POI pins and full
+      stats. Share button renders exploration card via ImageRenderer.
+
+WHY:  Proves depth beyond voice. Shows the "Spatial Preference Graph"
+      concept. Great for demo screenshots.
+
+SCALE: Handles: empty state (message shown), many logs (LazyVStack),
+       sharing (rendered to image).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - No ability to delete journal entries.
+  - Detail view shows "Exploration log not found" in gray text if log
+    is missing — should be a proper placeholder.
+  - No export/archive beyond image sharing.
+
+--------------------------------------------------------------------------------
+FEATURE 19: Walk Me Home SMS + Emergency Contact
+--------------------------------------------------------------------------------
+WHAT: Emergency contact receives SMS with Apple Maps link on Walk Me Home
+      activation and auto-SOS triggers.
+
+HOW:  Opens SMS compose dialog via UIApplication.shared.open(sms: URL).
+      Message includes: user name, mode (Walk Me Home or SOS), Apple Maps
+      link with coordinates, timestamp.
+
+SCALE: Works on any iOS device with SMS capability.
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    7/10
+ISSUES:
+  - SMS dialog opened but not confirmed sent. System assumes success.
+  - No fallback if SMS capability unavailable (e.g., iPad without cellular).
+
+--------------------------------------------------------------------------------
+FEATURE 20: Usage Tracking + Free Tier Limits
+--------------------------------------------------------------------------------
+WHAT: Free users get 30 min/day voice and 5 Snap & Ask/day. Warning at
+      5 minutes remaining. Upgrade prompt when limit hit.
+
+HOW:  UsageTracker.swift tracks daily voice seconds and snap count. Keys
+      stored with date stamp, reset at midnight. Warning injected into
+      AI conversation ("you have about X minutes remaining"). Upgrade
+      prompt (PaywallView) shown when limit exceeded.
+
+SCALE: Date-based reset works across timezone changes. Usage persists
+       across app restarts.
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    3/10 — BROKEN
+ISSUES:
+  - CRITICAL: UsageTracker.swift line 11: `isProUser: Bool = true`
+    This is a testing bypass that gives ALL users unlimited access.
+    The entire monetization story is dead. Must revert to read from
+    UserDefaults/StoreKit before any demo involving business model.
+  - If this bypass is reverted, the actual tracking logic works correctly.
+
+--------------------------------------------------------------------------------
+FEATURE 21: Paywall + StoreKit 2
+--------------------------------------------------------------------------------
+WHAT: "RAAH Pro" subscription: $12.99/month or $99/year. Glassmorphism
+      upgrade sheet with feature list, pricing cards, purchase flow.
+
+HOW:  StoreKitManager.swift handles product loading, purchase verification,
+      transaction listening. Product IDs: com.raah.pro.monthly,
+      com.raah.pro.yearly. PaywallView shows feature grid and pricing
+      cards with loading spinner during purchase.
+
+SCALE: Standard StoreKit 2 pattern with receipt verification.
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    6/10
+ISSUES:
+  - Prices hardcoded as fallback if products don't load from App Store.
+    Real products must be configured in App Store Connect.
+  - Purchase failure shows no error UI — fails silently.
+  - Combined with isProUser bypass, paywall is currently non-functional.
+
+--------------------------------------------------------------------------------
+FEATURE 22: Analytics Events
+--------------------------------------------------------------------------------
+WHAT: Local event logging for session metrics, POI discovery, feature usage.
+      Stats visible in Settings ("Your Stats" section).
+
+HOW:  AnalyticsLogger.swift logs events to Documents/raah_analytics.json.
+      Batch writes every 5 events. 26 event types tracked. 90-day auto-
+      prune. Stats computed: sessions/week, POIs discovered, minutes
+      explored, snaps/week, most viewed POI type.
+
+WHY:  When a VC asks "what's your average session length?" you need data.
+
+SCALE: Handles: high-frequency logging (batch writes), storage growth
+       (90-day prune), concurrent access.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    9/10
+ISSUES:
+  - Local only. Not yet wired to Mixpanel/Amplitude (ready for one-line
+    integration).
+
+--------------------------------------------------------------------------------
+FEATURE 23: Share & Social
+--------------------------------------------------------------------------------
+WHAT: Share POI discovery cards and exploration summaries as images.
+      Deep link support (raah://poi/{id}).
+
+HOW:  ShareCardView.swift renders POI cards and exploration summaries
+      via ImageRenderer (SwiftUI → UIImage at screen scale). Standard
+      UIActivityViewController for sharing. Deep link registered in
+      Info.plist, handled in RAAHApp.swift (switches to Explore tab).
+
+SCALE: Handles: rendering at retina scale, all share targets (Messages,
+       Instagram, etc.), deep link parsing.
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    8/10
+ISSUES:
+  - Deep link only switches tab — doesn't actually navigate to the POI.
+  - Share cards are static images — no interactive content.
+
+--------------------------------------------------------------------------------
+FEATURE 24: India-Specific Features (Mappls)
+--------------------------------------------------------------------------------
+WHAT: DigiPin doorstep-accuracy addressing, road alerts (potholes, speed
+      breakers, construction, flooding), geofenced to India.
+
+HOW:  MapplsService.swift uses OAuth2 token management with expiry tracking.
+      DigiPin via reverse geocode. Road alerts via nearby category search.
+      Geofenced: only activates when LocationManager detects user is in
+      India (lat 6-37, lon 68-97.5). Data injected into system prompt.
+
+SCALE: Token auto-refresh on expiry. Alert type detection via keyword
+       matching on descriptions.
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    7/10
+ISSUES:
+  - Requires paid Mappls API credentials. Silent failure if not configured.
+  - Alert type detection uses substring matching — could misclassify.
+  - Hardcoded 500m search radius.
+
+--------------------------------------------------------------------------------
+BONUS FEATURE 25: Profile Isolation
+--------------------------------------------------------------------------------
+WHAT: Per-user data isolation. Each user gets a UUID, all storage keys
+      prefixed with first 8 chars of UUID. One user's preferences never
+      leak to another.
+
+HOW:  AppState.resolveProfileId() creates or restores active profile.
+      All UserDefaults keys use profileKey() helper: "raah_{8chars}_{key}".
+      ShortTermMemory and LongTermMemory accept userId in init for scoped
+      storage keys. Migration: on first run after update, copies all flat
+      "raah_*" keys to prefixed keys automatically.
+
+SCALE: Clean architecture ready for multi-user profile switching (future).
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    9/10
+ISSUES:
+  - No profile switching UI yet (single profile per device for MVP).
+  - UsageTracker not yet profile-scoped (usage is device-wide).
+
+--------------------------------------------------------------------------------
+BONUS FEATURE 26: Context Validation & Self-Healing
+--------------------------------------------------------------------------------
+WHAT: Auto-detects and repairs incomplete context data.
+
+HOW:  ContextValidator.swift checks 10+ requirements (location name,
+      timezone, weather, POIs, emergency numbers, etc.). For each gap,
+      attempts async repair (reverse geocode, weather re-fetch, emergency
+      number lookup from 40+ country database).
+
+SCALE: Handles gracefully if repair fails (marks as unfixable, continues).
+
+IMPLEMENTATION: 10/10
+RELIABILITY:    9/10
+ISSUES:
+  - Emergency numbers table is static (not fetched from API). Could become
+    outdated if countries change numbers.
+
+--------------------------------------------------------------------------------
+BONUS FEATURE 27: HealthKit Heart Rate Integration
+--------------------------------------------------------------------------------
+WHAT: Apple Watch heart rate modulates orb breathing animation.
+
+HOW:  HealthKitManager.swift uses HKAnchoredObjectQuery for live HR updates.
+      OrbView.swift uses heartRate value to scale breathing cycle speed.
+
+SCALE: Works with Apple Watch or any HealthKit HR source.
+
+IMPLEMENTATION: 8/10
+RELIABILITY:    8/10
+ISSUES:
+  - Feature is wired but subtle — users may not notice the effect.
+
+--------------------------------------------------------------------------------
+BONUS FEATURE 28: Design System
+--------------------------------------------------------------------------------
+WHAT: Complete glassmorphism design language with 5 accent themes, 3 orb
+      styles, time-of-day palette, and consistent spacing/typography/motion.
+
+HOW:  RAAHTheme namespace defines spacing (xxxs 2pt → xxxl 64pt), radius
+      (sm 12pt → pill 100pt), typography (caption 11pt → largeTitle 34pt),
+      motion (snappy/smooth/gentle/breathe/pulse), shadows (soft/medium/glow).
+      TimeOfDayPalette shifts background gradients based on hour.
+      GlassCard, GlassIconButton, GlassPillButton, GlassToggleRow,
+      GlassNavRow provide reusable components.
+
+SCALE: Consistent across all 9 views and 5 components.
+
+IMPLEMENTATION: 10/10
+RELIABILITY:    10/10
+ISSUES:
+  - None. This is production-grade.
+
+--------------------------------------------------------------------------------
+BONUS FEATURE 29: Voice Error Recovery
+--------------------------------------------------------------------------------
+WHAT: Auto-reconnects on WebSocket drop with exponential backoff.
+
+HOW:  handleUnexpectedDisconnect() cleans up, checks attempt count (max 3),
+      backs off exponentially (1s → 2s → 4s), preserves system prompt
+      across reconnects. voiceState = .reconnecting shows amber indicator.
+
+SCALE: Handles: cellular handoffs, WiFi switches, brief dead zones.
+
+IMPLEMENTATION: 9/10
+RELIABILITY:    8/10
+ISSUES:
+  - After max retries, shows "Connection lost. Tap to retry." but tap-to-
+    retry requires stopping and restarting session manually.
+
+--------------------------------------------------------------------------------
+BONUS FEATURE 30: Affiliate Ticket Integration
+--------------------------------------------------------------------------------
+WHAT: GetYourGuide skip-the-line ticket search for museums and landmarks.
+
+HOW:  AffiliateService.swift searches GetYourGuide API when user shows
+      purchase intent. Tool call find_tickets defined in Realtime service.
+      Results returned with title, price, booking URL.
+
+SCALE: Graceful degradation without API key (returns "No tickets found").
+
+IMPLEMENTATION: 7/10
+RELIABILITY:    6/10
+ISSUES:
+  - Currency hardcoded to USD.
+  - No error logging (silent failures).
+  - Purchase intent detection is basic keyword matching.
+
+
+================================================================================
+4. SERVICES & INFRASTRUCTURE AUDIT
+================================================================================
+
+PRODUCTION READINESS SCORES (1-10):
+
+  Service                Score   Notes
+  ────────────────────── ────── ─────────────────────────────────────
+  OpenAIRealtimeService   8/10  Preview model deprecation risk
+  ContextPipeline         8/10  Demo POIs need removal
+  ContextValidator        9/10  Excellent self-healing
+  DirectionsService       8/10  Smart fallback chain
+  WeatherService          9/10  Free, reliable, no key needed
+  OverpassService         8/10  Core POI source, free
+  WikipediaService        8/10  Good fallback chain
+  WebSearchService        8/10  Good local knowledge
+  SafetyScoreService      7/10  Heuristic fallback works
+  GooglePlacesService     7/10  Food-only, needs key
+  MapplsService           6/10  India-only, needs paid key
+  AffiliateService        6/10  No error logging, silent fails
+  SupabaseService         7/10  Optional, works without
+  SpatialCache            9/10  Excellent caching strategy
+  LocationManager         9/10  Robust with sim fallback
+  AudioSessionManager     9/10  Handles AirPods + interrupts
+  HealthKitManager        8/10  Complete but subtle feature
+  ExplorationLogger       8/10  Simple, effective
+  AnalyticsLogger         8/10  Local-first, batch writes
+  UsageTracker            3/10  BROKEN — isProUser bypass
+  StoreKitManager         8/10  Standard StoreKit 2
+  ShortTermMemory         9/10  24h TTL, profile-scoped
+  LongTermMemory          7/10  GPT extraction, local fallback
+
+FREE API DEPENDENCIES (no key needed, always work):
+  - Open-Meteo (weather): api.open-meteo.com
+  - OSRM (directions): router.project-osrm.org
+  - Overpass (POIs): overpass-api.de
+  - Wikipedia: en.wikipedia.org
+  - Wikivoyage: en.wikivoyage.org
+  - Wikidata: wikidata.org
+  - Apple MKDirections (built-in)
+  - Apple CLGeocoder (built-in)
+
+PAID/KEY-REQUIRED DEPENDENCIES:
+  - OpenAI Realtime (REQUIRED): voice conversation
+  - OpenAI Vision (REQUIRED): Snap & Ask
+  - Brave Search (optional): web knowledge
+  - Supabase (optional): cloud memory
+  - Google Places (optional): enhanced food POIs
+  - Mappls (optional): India features
+  - GetYourGuide (optional): ticket affiliate
+  - GeoSure (optional): safety scoring
+
+
+================================================================================
+5. UI/UX ASSESSMENT
+================================================================================
+
+VISUAL QUALITY: Premium
+  - Glassmorphism consistently applied across all views
+  - 5 accent themes with gradient support
+  - 3 orb styles (Fluid, Crystal, PulseRing) with state-aware animations
+  - Time-of-day palette shifts background warmth
+  - Haptic feedback on every interaction (light/medium/heavy/selection)
+
+ANIMATION QUALITY: Excellent
+  - Orb: morphing gradients (8s), rotation (20s), breathing (heart-rate
+    synced), glow pulsing, listening particles (12 dots), speaking ripples
+  - Tab bar: matched geometry effect for smooth transitions
+  - Map camera: easeInOut 0.5s follow with heading
+  - All transitions use defined motion curves (snappy/smooth/gentle)
+
+NAVIGATION:
+  - 3 tabs: Home, Explore, Settings
+  - Onboarding gates main app
+  - fullScreenCover for navigation map
+  - Sheets for: Snap & Ask, Safety Overlay, Paywall
+  - All sheets gated on !isNavigating to prevent conflicts
+
+ACCESSIBILITY:
+  - All text uses Typography scale (Dynamic Type supported)
+  - Color is never sole indicator (always paired with icon/text)
+  - VoiceOver: buttons have implicit labels from systemName icons
+  - Dark mode forced (high contrast white-on-dark)
+  - Large touch targets (orb 200pt, capture button 80pt)
+
+GAPS:
+  - No loading states in SafetyOverlaySheet
+  - No empty state for POI context strip on HomeView
+  - Snap & Ask shows raw error strings
+  - No back button in onboarding
+  - Settings stats don't refresh in real-time
+  - No conversation starter suggestions when voice starts
+
+
+================================================================================
+6. KNOWN ISSUES & BUGS
+================================================================================
+
+CRITICAL (will break demo or credibility):
+
+  1. UsageTracker.isProUser = true (bypass)
+     File: Services/UsageTracker.swift, line 11
+     Impact: All users get unlimited access. Monetization story dead.
+     Fix: Revert to read from UserDefaults/StoreKit. 5 minutes.
+
+  2. Demo POIs in ContextPipeline
+     File: Services/ContextPipeline.swift, lines 130-236
+     Impact: Hardcoded fake Goa restaurants appear as real POIs.
+     Fix: Gate behind #if targetEnvironment(simulator). 10 minutes.
+
+  3. Safety alert condition inverted
+     File: ViewModels/AppState.swift, check_safety_score handler
+     Impact: Safety alert suppressed during active voice session.
+     Fix: Remove `&& !realtimeService.isConnected`. 5 minutes.
+
+  4. OpenAI model is dated preview
+     File: Services/OpenAIRealtimeService.swift, line 54
+     Impact: Model could be deprecated, breaking voice entirely.
+     Fix: Update model ID to latest stable. 10 minutes.
+
+MEDIUM (degraded experience, not fatal):
+
+  5. No off-route detection in navigation
+     Impact: Navigation silently waits if user goes wrong way.
+     Fix: Add distance check — if >100m from any remaining waypoint
+          and moving away, send "you seem off route" message. 1 hour.
+
+  6. share_live_location doesn't verify SMS sent
+     Impact: System assumes location shared even if user cancels dialog.
+     No easy fix (iOS limitation). Mitigate with UI feedback.
+
+  7. No loading state in SafetyOverlaySheet
+     Impact: Sheet shows stale data while safety evaluation runs.
+     Fix: Add isEvaluating state with ProgressView. 20 minutes.
+
+  8. Proactive narration can interrupt conversation
+     Impact: Narration fires immediately after idle, may feel jarring.
+     Fix: Add 3-second idle buffer before firing. 15 minutes.
+
+  9. Double session start vulnerability
+     Impact: Calling startVoiceSession twice causes listeners to
+     double-register, audio engine conflicts.
+     Fix: Add isStartingSession guard flag. 15 minutes.
+
+LOW (cosmetic or edge-case):
+
+  10. Turn markers too small (14px) on navigation map
+  11. No back button in onboarding
+  12. Journal entries can't be deleted
+  13. Settings stats don't live-refresh
+  14. Deep link only switches tab, doesn't navigate to POI
+  15. Camera startup has no timeout/failure recovery
+  16. Emergency number table is static (could become outdated)
+  17. Dwell tracker grows unbounded during long sessions
+  18. Cache has no size eviction strategy
+
+
+================================================================================
+7. WHAT STOPS A PERFECT DEMO
+================================================================================
+
+If you're demoing RAAH to investors, these are the things that could go wrong,
+ranked by likelihood and impact:
+
+HIGH LIKELIHOOD, HIGH IMPACT:
+
+  A. "Why can everyone use it for free?"
+     The isProUser bypass means your monetization pitch has no proof.
+     When you say "30 min/day free, then paywall" — it doesn't actually
+     happen. Fix: 5-minute code change.
+
+  B. "Those restaurant recommendations seem suspicious"
+     If you demo in Goa and Overpass is slow, fake Cafe Bodega appears.
+     If you demo outside Goa, no fallback and sparse areas show few POIs.
+     Fix: 10-minute code change (simulator-only gate).
+
+  C. Voice drops during demo
+     WiFi→cellular handoff, brief dead zone, or network congestion.
+     Reconnect logic works but takes 1-4 seconds. Orb shows "Reconnecting"
+     in amber. Not a bug, but looks bad.
+     Mitigation: Demo on stable WiFi.
+
+  D. "What if I walk the wrong way?"
+     If you show navigation and deliberately go off-route, nothing happens.
+     The app silently waits. Investor asks "shouldn't it tell me I'm going
+     the wrong way?" and you have no answer.
+     Fix: 1 hour.
+
+MEDIUM LIKELIHOOD, HIGH IMPACT:
+
+  E. Safety overlay shows stale data
+     If GeoSure API is slow (>5 seconds), the safety sheet hangs with
+     old data. User sees wrong safety level.
+
+  F. SOS with no emergency contact
+     If you forgot to set emergency contact in Settings, triple-tap SOS
+     does nothing with zero feedback. Embarrassing during safety demo.
+
+  G. OpenAI deprecates model
+     The preview model is 15 months old. If deprecated, voice breaks
+     completely. No fallback. Low probability for a specific demo day,
+     but nonzero.
+
+LOW LIKELIHOOD, MEDIUM IMPACT:
+
+  H. "What do I say to it?"
+     User starts voice session, sees the orb listening, freezes. No
+     conversation starter suggestions visible. Awkward silence.
+     Fix: Add 3-4 tappable chips ("What's nearby?", "Find me food",
+     "Tell me about this area"). 1 hour.
+
+  I. Proactive narration interrupts a natural moment
+     User is mid-question, AI finishes responding, narration immediately
+     fires about a nearby temple. User feels interrupted.
+
+  J. Navigation bottom card doesn't show ETA
+     Investor asks "how far is it?" — the card only shows step distance,
+     not total remaining distance or time estimate.
+
+
+================================================================================
+8. RECOMMENDATIONS
+================================================================================
+
+PRIORITY 1 — FIX BEFORE ANY DEMO (3.5 hours total):
+
+  [ ] Revert isProUser bypass (5 min)
+  [ ] Gate demo POIs behind simulator flag (10 min)
+  [ ] Fix safety alert condition (5 min)
+  [ ] Update OpenAI model ID (10 min)
+  [ ] Add conversation starter chips on HomeView (1 hr)
+  [ ] Add distance/ETA to navigation bottom card (20 min)
+  [ ] Add off-route detection (1 hr)
+  [ ] Add double session guard (15 min)
+  [ ] Add proactive narration idle buffer (15 min)
+
+PRIORITY 2 — POLISH FOR FUNDED MVP (5 hours total):
+
+  [ ] Voice selection in Settings (alloy, ash, coral, sage, verse) (30 min)
+  [ ] Session summary card when voice ends (1 hr)
+  [ ] Loading state in SafetyOverlaySheet (20 min)
+  [ ] Preference management in Settings (swipe-to-delete) (30 min)
+  [ ] Friendly error messages in Snap & Ask (20 min)
+  [ ] Back button in onboarding (30 min)
+  [ ] Move OpenAI key to Keychain (30 min)
+  [ ] PaywallView error handling on purchase failure (20 min)
+  [ ] SOS feedback when no emergency contact set (20 min)
+  [ ] Camera initialization timeout (20 min)
+
+PRIORITY 3 — POST-DEMO IMPROVEMENTS:
+
+  [ ] Unified error handling pattern across all services
+  [ ] Cache size eviction strategy
+  [ ] Profile switching UI
+  [ ] Dwell tracker cleanup
+  [ ] Deep link full POI navigation
+  [ ] Journal entry deletion
+  [ ] Settings live-refresh
+  [ ] Offline mode (cached data only)
+  [ ] Regional language support
+  [ ] Wire analytics to Mixpanel/Amplitude
+
+
+================================================================================
+9. APPENDIX: FILE MAP
+================================================================================
+
+/Users/aakarshasawa/Desktop/RAAH/RAAH/
+├── RAAHApp.swift                        App entry, environment setup
+├── ContentView.swift                    Tab routing, onboarding gate, sheets
+│
+├── Config/
+│   └── APIKeys.swift                    API key management + validation
+│
+├── Models/
+│   └── Models.swift                     All data types (30+ structs/enums)
+│
+├── ViewModels/
+│   ├── AppState.swift                   Central state (1048 lines)
+│   ├── SafetyViewModel.swift            Safety monitoring
+│   └── ExploreViewModel.swift           Map state management
+│
+├── Views/
+│   ├── HomeView.swift                   Main voice/orb screen
+│   ├── ExploreMapView.swift             Interactive POI map
+│   ├── OnboardingView.swift             5-page first-run flow
+│   ├── SettingsView.swift               Profile, dietary, appearance, API keys
+│   ├── SnapAndAskView.swift             Camera → Vision AI
+│   ├── SafetyOverlaySheet.swift         Safety alerts + actions
+│   ├── PaywallView.swift                RAAH Pro upgrade
+│   ├── NavigationMapView.swift          Turn-by-turn map
+│   └── JournalView.swift                Exploration history
+│
+├── Components/
+│   ├── OrbView.swift                    Voice state indicator (3 styles)
+│   ├── GlassCard.swift                  Glass container components
+│   ├── FloatingTabBar.swift             Bottom navigation
+│   ├── WaveformView.swift               Audio visualization
+│   └── ShareCardView.swift              Shareable image cards
+│
+├── Design/
+│   ├── Theme.swift                      Spacing, typography, colors, motion
+│   ├── LiquidGlass.swift                Frosted glass effects
+│   └── HapticEngine.swift               Tactile feedback
+│
+├── Services/
+│   ├── OpenAIRealtimeService.swift      WebSocket voice pipeline
+│   ├── OpenAIVisionService.swift        Image analysis (GPT-4o)
+│   ├── ContextPipeline.swift            Spatial context orchestration
+│   ├── ContextValidator.swift           Self-healing context
+│   ├── DirectionsService.swift          OSRM + MKDirections
+│   ├── OverpassService.swift            OSM POI fetching
+│   ├── WikipediaService.swift           POI enrichment
+│   ├── WeatherService.swift             Open-Meteo weather
+│   ├── SafetyScoreService.swift         Safety evaluation
+│   ├── GooglePlacesService.swift        Google Places food POIs
+│   ├── MapplsService.swift              India-specific mapping
+│   ├── AffiliateService.swift           GetYourGuide tickets
+│   ├── WebSearchService.swift           Brave Search knowledge
+│   ├── SupabaseService.swift            Cloud backend
+│   ├── SpatialCache.swift               Geohash-indexed cache
+│   ├── LocationManager.swift            GPS + movement detection
+│   ├── AudioSessionManager.swift        Audio routing
+│   ├── HealthKitManager.swift           Heart rate monitoring
+│   ├── ExplorationLogger.swift          Trip session logging
+│   ├── UsageTracker.swift               Free tier limits
+│   ├── AnalyticsLogger.swift            Event logging
+│   └── StoreKitManager.swift            In-app purchases
+│
+└── Memory/
+    ├── ShortTermMemory.swift            25-interaction buffer
+    └── LongTermMemory.swift             Preference extraction + storage
+
+TOTAL: 48 Swift files, ~15,000 lines of code
+
+
+================================================================================
+END OF REPORT
+================================================================================
+
+Prepared: March 2, 2026
+Codebase: /Users/aakarshasawa/Desktop/RAAH/
+Build: Compiles clean, zero errors (iOS 26.2 SDK, iPhone 17 Pro Simulator)
