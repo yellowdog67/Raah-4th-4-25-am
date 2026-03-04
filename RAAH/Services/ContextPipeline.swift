@@ -325,10 +325,14 @@ final class ContextPipeline {
 
         EDITORIAL NARRATION (Feature #7):
         - Every POI may have a description after the colon in its entry — that is Google's editorial summary or Wikipedia text. Use it.
-        - When the user asks "what's around here?", "tell me about places I'm passing", or "narrate my walk" — describe the 3–5 nearest open places using those summaries. Don't just list names.
+        - When the user asks "what's around here?", "tell me about places I'm passing", or "narrate my walk" — describe the 3–5 nearest open, narration-worthy places. Don't just list names.
         - Format: "Just ahead is [name] — [summary]. It's open and about [X] min away."
         - If a place has no description, describe it from its type, rating, and price level instead.
         - Prefer open places. Skip permanently or temporarily closed places in narration.
+        - WORTHINESS GATE — narration-worthy: landmarks, museums, heritage sites, parks, [💎 HIDDEN GEM] places, restaurants/cafes rated 4.0★+.
+        - UTILITY GATE — POIs tagged [UTILITY — silent unless asked or user showed intent] are NEVER narrated proactively. \
+        Exception: if the user mentioned a utility need (cash, ATM, money, medicine, pharmacy, fuel, bus, hospital) in the recent conversation, surface the relevant utility once. \
+        Check "RECENT CONVERSATION" below for this intent signal before deciding.
 
         DIETARY + CUISINE MATCH (Feature #6 — never violate):
         - POIs have [cuisine: X] tags. Cross-reference with the user's dietary restrictions.
