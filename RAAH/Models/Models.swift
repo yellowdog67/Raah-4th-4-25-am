@@ -284,6 +284,48 @@ enum POIType: String, Codable {
         if tags["shop"] != nil || tags["amenity"] == "cafe" || tags["amenity"] == "restaurant" || tags["amenity"] == "fast_food" || tags["amenity"] == "bar" || tags["amenity"] == "pub" { return .commercial }
         return .unknown
     }
+
+    /// Maps Google Places `primaryType` strings to POIType.
+    static func fromGoogleType(_ type: String) -> POIType {
+        switch type {
+        case "restaurant", "cafe", "bar", "bakery", "food",
+             "fast_food_restaurant", "coffee_shop", "ice_cream_shop",
+             "dessert_shop", "juice_shop", "meal_takeaway", "meal_delivery":
+            return .commercial
+        case "tourist_attraction", "cultural_landmark", "historical_landmark":
+            return .heritage
+        case "museum", "art_gallery":
+            return .museum
+        case "park", "national_park", "botanical_garden", "wildlife_park":
+            return .naturalFeature
+        case "lodging", "hotel", "motel", "bed_and_breakfast", "hostel", "resort_hotel":
+            return .hotel
+        case "pharmacy", "drugstore":
+            return .pharmacy
+        case "atm", "bank":
+            return .atm
+        case "hospital", "doctor", "dentist", "medical_lab", "physiotherapist":
+            return .hospital
+        case "police":
+            return .police
+        case "bus_station", "transit_station":
+            return .busStop
+        case "train_station", "subway_station", "light_rail_station":
+            return .trainStation
+        case "parking":
+            return .parking
+        case "hindu_temple", "mosque", "church", "synagogue", "place_of_worship":
+            return .religious
+        default:
+            if type.contains("restaurant") || type.contains("food") || type.contains("cafe") || type.contains("bar") {
+                return .commercial
+            }
+            if type.contains("museum") || type.contains("gallery") { return .museum }
+            if type.contains("park") || type.contains("garden") { return .naturalFeature }
+            if type.contains("hotel") || type.contains("lodging") { return .hotel }
+            return .unknown
+        }
+    }
 }
 
 // MARK: - Memory & Interactions
@@ -614,29 +656,120 @@ struct SpatialContext {
         }
 
         if !pois.isEmpty {
-            let poiDescriptions = pois.prefix(15).map { poi in
+            // Sort: open first, then opening-soon (within 60 min), then closed
+            let sortedPOIs = pois.sorted { a, b in
+                let aOpen = a.tags["is_open_now"]
+                let bOpen = b.tags["is_open_now"]
+                if aOpen == "true" && bOpen != "true" { return true }
+                if aOpen != "true" && bOpen == "true" { return false }
+                // Both closed — opening-soon ranked above fully closed
+                if aOpen != "true" && bOpen != "true" {
+                    let aOpensSoon = a.tags["opens_at"].flatMap { minutesUntilOpen(opensAt: $0, now: now, timeZone: timeZone) }.map { $0 <= 60 } ?? false
+                    let bOpensSoon = b.tags["opens_at"].flatMap { minutesUntilOpen(opensAt: $0, now: now, timeZone: timeZone) }.map { $0 <= 60 } ?? false
+                    if aOpensSoon && !bOpensSoon { return true }
+                    if !aOpensSoon && bOpensSoon { return false }
+                }
+                return (a.distance ?? .infinity) < (b.distance ?? .infinity)
+            }
+
+            let poiDescriptions = sortedPOIs.prefix(20).map { poi in
                 var desc = "- \(poi.name) (\(poi.type.rawValue))"
-                if let hours = poi.tags["opening_hours"], !hours.isEmpty {
+
+                // Rating + price (Google Places)
+                var meta: [String] = []
+                if let rating = poi.tags["rating"] {
+                    var r = "\(rating)★"
+                    if let count = poi.tags["user_ratings_total"] { r += " (\(count))" }
+                    meta.append(r)
+                }
+                if let price = poi.tags["price_level"] { meta.append(price) }
+                if !meta.isEmpty { desc += " [\(meta.joined(separator: ", "))]" }
+
+                // Feature #9: Hidden gem — high rating, few reviews
+                if let ratingStr = poi.tags["rating"],
+                   let rating = Double(ratingStr), rating >= 4.5,
+                   let countStr = poi.tags["user_ratings_total"],
+                   let count = Int(countStr), count < 80 {
+                    desc += " [💎 HIDDEN GEM]"
+                }
+
+                // Open/closed status — Google real-time takes priority
+                if poi.tags["business_status"] == "temporarily_closed" {
+                    desc += " [TEMPORARILY CLOSED]"
+                } else if let isOpen = poi.tags["is_open_now"] {
+                    if isOpen == "true" {
+                        // Show open + today's hours
+                        if let todayHours = poi.tags["today_hours"] {
+                            if let closes = poi.tags["closes_at"] {
+                                desc += " [OPEN NOW — closes \(closes)]"
+                            } else {
+                                desc += " [OPEN NOW — \(todayHours)]"
+                            }
+                        } else {
+                            desc += " [OPEN NOW]"
+                        }
+                    } else {
+                        // Closed — show opens-in minutes if within 60 min, otherwise full hours
+                        if let opensAt = poi.tags["opens_at"],
+                           let mins = minutesUntilOpen(opensAt: opensAt, now: now, timeZone: timeZone),
+                           mins <= 60 {
+                            desc += " [OPENS IN \(mins) min — at \(opensAt)]"
+                        } else if let todayHours = poi.tags["today_hours"], todayHours.lowercased() != "closed" {
+                            desc += " [CLOSED NOW — today: \(todayHours)]"
+                        } else {
+                            desc += " [CLOSED NOW]"
+                        }
+                    }
+                } else if let hours = poi.tags["opening_hours"], !hours.isEmpty {
+                    // Overpass OSM hours — parse with OpeningHoursChecker
                     if let status = OpeningHoursChecker.status(hours: hours, now: now, timeZone: timeZone) {
                         desc += " [\(status)]"
                     } else {
                         desc += " [hours: \(hours)]"
                     }
+                } else if let todayHours = poi.tags["today_hours"], !todayHours.isEmpty {
+                    desc += " [today: \(todayHours)]"
                 }
+
+                // Cuisine — OSM tag first, then derive from Google primary_type (Feature #6)
                 if let cuisine = poi.tags["cuisine"], !cuisine.isEmpty {
                     desc += " [cuisine: \(cuisine)]"
+                } else if let primaryType = poi.tags["primary_type"] {
+                    let cuisineTypes: Set<String> = [
+                        "seafood_restaurant", "indian_restaurant", "chinese_restaurant",
+                        "italian_restaurant", "mexican_restaurant", "thai_restaurant",
+                        "japanese_restaurant", "american_restaurant", "steak_house",
+                        "pizza_restaurant", "hamburger_restaurant", "sandwich_shop",
+                        "brunch_restaurant", "breakfast_restaurant"
+                    ]
+                    if cuisineTypes.contains(primaryType) {
+                        desc += " [cuisine: \(primaryType.replacingOccurrences(of: "_", with: " "))]"
+                    }
                 }
+
+                // Description: Wikipedia > editorial summary from Google
                 if let summary = poi.wikipediaSummary {
                     let truncated = summary.count > 100 ? String(summary.prefix(100)) + "..." : summary
                     desc += ": \(truncated)"
+                } else if let editorial = poi.tags["editorial_summary"], !editorial.isEmpty {
+                    let truncated = editorial.count > 200 ? String(editorial.prefix(200)) + "..." : editorial
+                    desc += ": \(truncated)"
                 }
+
                 if let dist = poi.distance {
-                    let walkMin = max(1, Int(dist / 80.0))
+                    let walkMin = max(1, Int(dist / 65.0))
                     desc += " [\(Int(dist))m, ~\(walkMin) min walk]"
+
+                    // Feature #10: warn if place closes before user arrives
+                    if poi.tags["is_open_now"] == "true",
+                       let closesAt = poi.tags["closes_at"],
+                       closesBeforeArrival(closesAt: closesAt, walkMinutes: walkMin, now: now, timeZone: timeZone) {
+                        desc += " [⚠️ CLOSES BEFORE ARRIVAL]"
+                    }
                 }
                 return desc
             }
-            parts.append("NEARBY POINTS OF INTEREST:\n\(poiDescriptions.joined(separator: "\n"))")
+            parts.append("NEARBY POINTS OF INTEREST (sorted: open first, then closed):\n\(poiDescriptions.joined(separator: "\n"))")
         }
 
         if !nearbyOffers.isEmpty {
@@ -662,6 +795,59 @@ struct SpatialContext {
         }
 
         return parts.joined(separator: "\n\n")
+    }
+
+    // Feature #1: returns minutes until a place opens (nil if unparseable or >60 min away)
+    private func minutesUntilOpen(opensAt: String, now: Date, timeZone: TimeZone) -> Int? {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = timeZone
+        fmt.dateFormat = "h:mm a"
+        guard let parsedTime = fmt.date(from: opensAt) else { return nil }
+
+        var cal = Calendar.current
+        cal.timeZone = timeZone
+        let todayComponents = cal.dateComponents([.year, .month, .day], from: now)
+        let openComponents = cal.dateComponents([.hour, .minute], from: parsedTime)
+        var combined = DateComponents()
+        combined.year = todayComponents.year
+        combined.month = todayComponents.month
+        combined.day = todayComponents.day
+        combined.hour = openComponents.hour
+        combined.minute = openComponents.minute
+        combined.second = 0
+        combined.timeZone = timeZone
+        guard let openDate = cal.date(from: combined) else { return nil }
+
+        let mins = Int(openDate.timeIntervalSince(now) / 60)
+        return mins > 0 ? mins : nil
+    }
+
+    // Feature #10: returns true if the place closes before the user can walk there
+    private func closesBeforeArrival(closesAt: String, walkMinutes: Int, now: Date, timeZone: TimeZone) -> Bool {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = timeZone
+        fmt.dateFormat = "h:mm a"
+        guard let parsedTime = fmt.date(from: closesAt) else { return false }
+
+        // Build a Date on today's date at the parsed close time
+        var cal = Calendar.current
+        cal.timeZone = timeZone
+        let todayComponents = cal.dateComponents([.year, .month, .day], from: now)
+        let closeComponents = cal.dateComponents([.hour, .minute], from: parsedTime)
+        var combined = DateComponents()
+        combined.year = todayComponents.year
+        combined.month = todayComponents.month
+        combined.day = todayComponents.day
+        combined.hour = closeComponents.hour
+        combined.minute = closeComponents.minute
+        combined.second = 0
+        combined.timeZone = timeZone
+        guard let closeDate = cal.date(from: combined) else { return false }
+
+        let arrivalDate = now.addingTimeInterval(Double(walkMinutes) * 60)
+        return arrivalDate >= closeDate
     }
 }
 

@@ -34,6 +34,9 @@ final class AppState {
     var dietaryRestrictions: String {
         didSet { UserDefaults.standard.set(dietaryRestrictions, forKey: profileKey("dietary")) }
     }
+    var budgetPreference: String {
+        didSet { UserDefaults.standard.set(budgetPreference, forKey: profileKey("budget")) }
+    }
     var selectedVoice: AIVoice {
         didSet {
             UserDefaults.standard.set(selectedVoice.rawValue, forKey: profileKey("voice"))
@@ -243,6 +246,7 @@ final class AppState {
         self.emergencyContactPhone = defaults.string(forKey: "\(p)emergency_phone") ?? ""
         self.safetyOverlayEnabled = defaults.object(forKey: "\(p)safety_enabled") as? Bool ?? true
         self.dietaryRestrictions = defaults.string(forKey: "\(p)dietary") ?? ""
+        self.budgetPreference = defaults.string(forKey: "\(p)budget") ?? ""
         let voice = AIVoice(rawValue: defaults.string(forKey: "\(p)voice") ?? "") ?? .ash
         self.selectedVoice = voice
         self.realtimeService.voice = voice.rawValue
@@ -728,10 +732,41 @@ final class AppState {
                     self.analytics.log(.directionRequested, properties: ["destination": destName, "mode": "navigation"])
                     let firstStep = self.navigationSteps.first
                     let firstInstruction = firstStep.map { "\($0.instruction) for about \(Int($0.distance)) meters" } ?? "Start walking"
+
+                    // Feature #2: Pre-arrival briefing — look up destination in nearby POIs
+                    var briefingContext = ""
+                    let destNameLower = destName.lowercased()
+                    if let poi = self.contextPipeline.nearbyPOIs.first(where: {
+                        $0.name.lowercased().contains(destNameLower) ||
+                        destNameLower.contains($0.name.lowercased())
+                    }) {
+                        var briefParts: [String] = []
+                        if let editorial = poi.tags["editorial_summary"], !editorial.isEmpty {
+                            briefParts.append("About: \(editorial)")
+                        }
+                        if let rating = poi.tags["rating"] {
+                            var r = "Rated \(rating)★"
+                            if let count = poi.tags["user_ratings_total"] { r += " (\(count) reviews)" }
+                            if let price = poi.tags["price_level"] { r += ", \(price)" }
+                            briefParts.append(r)
+                        }
+                        if let isOpen = poi.tags["is_open_now"] {
+                            if isOpen == "true" {
+                                if let closes = poi.tags["closes_at"] { briefParts.append("Open now, closes \(closes)") }
+                                else { briefParts.append("Open now") }
+                            } else {
+                                briefParts.append("Currently CLOSED — warn the user before they walk there")
+                            }
+                        }
+                        if !briefParts.isEmpty {
+                            briefingContext = " DESTINATION BRIEFING: \(briefParts.joined(separator: ". ")). Give the user a natural 2–3 sentence briefing about this place BEFORE giving the first direction."
+                        }
+                    }
+
                     realtimeService.sendToolResult(
                         callId: callId,
-                        result: "Navigation to \(destName) (~\(structured.estimatedMinutes) min walk). " +
-                        "Tell the user: \(firstInstruction). " +
+                        result: "Navigation to \(destName) (~\(structured.estimatedMinutes) min walk).\(briefingContext) " +
+                        "Then tell the user: \(firstInstruction). " +
                         "That's it — I'll tell you the next turn when they get there."
                     )
                 } else {
@@ -746,6 +781,46 @@ final class AppState {
                         "Turn-by-turn directions are unavailable right now. " +
                         "Tell the user to open Apple Maps for navigation. " +
                         "DO NOT provide step-by-step directions yourself — you don't have the route data."
+                    )
+                }
+            }
+
+        case "search_nearby":
+            Task {
+                let query = args["query"] as? String ?? ""
+                let coord = locationManager.effectiveLocation.coordinate
+                let results = await contextPipeline.searchNearby(query: query, coordinate: coord)
+                if results.isEmpty {
+                    realtimeService.sendToolResult(
+                        callId: callId,
+                        result: "No results found for '\(query)' within 5km. The user may need to search further or it may not exist nearby."
+                    )
+                } else {
+                    let descriptions = results.prefix(5).map { poi -> String in
+                        var parts: [String] = [poi.name]
+                        if let dist = poi.distance {
+                            let mins = max(1, Int(dist / 65.0))
+                            parts.append("~\(Int(dist))m away (~\(mins) min walk)")
+                        }
+                        if let isOpen = poi.tags["is_open_now"] {
+                            if isOpen == "true" {
+                                if let closes = poi.tags["closes_at"] { parts.append("OPEN NOW (closes \(closes))") }
+                                else { parts.append("OPEN NOW") }
+                            } else {
+                                parts.append("CLOSED NOW")
+                            }
+                        } else if let hours = poi.tags["today_hours"] {
+                            parts.append("today: \(hours)")
+                        }
+                        if let rating = poi.tags["rating"] { parts.append("\(rating)★") }
+                        if let price = poi.tags["price_level"] { parts.append(price) }
+                        if let addr = poi.tags["address"] { parts.append("at \(addr)") }
+                        if let phone = poi.tags["phone"] { parts.append("call: \(phone)") }
+                        return parts.joined(separator: ", ")
+                    }
+                    realtimeService.sendToolResult(
+                        callId: callId,
+                        result: "Found nearby: \(descriptions.joined(separator: " | "))"
                     )
                 }
             }
@@ -915,6 +990,7 @@ final class AppState {
             preferences: longTermMemory.getPreferencesForPrompt(),
             shortTermHistory: shortTermMemory.getRecentContext(),
             dietaryRestrictions: dietaryRestrictions,
+            budgetPreference: budgetPreference,
             isNavigating: isNavigating,
             navigationDestination: navigationDestination,
             navigationCurrentStep: currentStep,

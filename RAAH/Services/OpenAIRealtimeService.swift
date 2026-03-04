@@ -634,6 +634,21 @@ final class OpenAIRealtimeService: NSObject {
             ],
             [
                 "type": "function",
+                "name": "search_nearby",
+                "description": "Search Google's place database for a specific business, chain, or type of place near the user. Use when the user asks about something NOT in the pre-loaded POI list — e.g. 'Is there a McDonald's near me?', 'find the nearest ATM', 'coffee shop open right now', 'pharmacy nearby'. This queries Google's 200M+ place database live.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "query": [
+                            "type": "string",
+                            "description": "What to search for. Be specific: 'McDonald's', 'ATM', 'open pharmacy', 'cheap Indian restaurant'. Include 'open now' if the user needs it open currently."
+                        ]
+                    ],
+                    "required": ["query"]
+                ]
+            ],
+            [
+                "type": "function",
                 "name": "search_local_knowledge",
                 "description": "Search the web for local recommendations, hidden gems, or niche finds. Use when the user asks for 'best X', 'hidden gem', 'local favorite', food recommendations by cuisine, or anything not answered by the nearby POI list.",
                 "parameters": [

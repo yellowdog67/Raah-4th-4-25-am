@@ -1,8 +1,10 @@
 import SwiftUI
+import CoreLocation
 
 struct SettingsView: View {
     @Environment(AppState.self) private var appState
     @State private var showingJournal = false
+    @State private var showingPOIList = false
     
     var body: some View {
         ScrollView {
@@ -11,6 +13,7 @@ struct SettingsView: View {
                 simulatorLocationTip
                 profileSection
                 dietarySection
+                budgetSection
                 journalSection
                 appearanceSection
                 safetySection
@@ -292,7 +295,70 @@ struct SettingsView: View {
         GlassCard {
             VStack(spacing: 16) {
                 sectionTitle("MEMORY")
-                
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Nearby places")
+                            .font(RAAHTheme.Typography.body(.medium))
+                        Text("\(appState.contextPipeline.nearbyPOIs.count) POIs in AI context")
+                            .font(RAAHTheme.Typography.caption())
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("View") {
+                        showingPOIList = true
+                    }
+                    .font(RAAHTheme.Typography.caption(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.trailing, 8)
+                    Button("Refresh") {
+                        SpatialCache.shared.clearAll()
+                        appState.refreshContext()
+                        HapticEngine.medium()
+                    }
+                    .font(RAAHTheme.Typography.caption(.medium))
+                    .foregroundStyle(appState.accentColor)
+                }
+
+                if showingPOIList && !appState.contextPipeline.nearbyPOIs.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(appState.contextPipeline.nearbyPOIs.prefix(30)) { poi in
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(poi.tags["source"] == "google" ? Color.blue : Color.orange)
+                                    .frame(width: 6, height: 6)
+                                Text(poi.name)
+                                    .font(RAAHTheme.Typography.caption(.medium))
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                if let dist = poi.distance {
+                                    Text("\(Int(dist))m")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        HStack(spacing: 12) {
+                            HStack(spacing: 4) {
+                                Circle().fill(Color.blue).frame(width: 6, height: 6)
+                                Text("Google").font(.system(size: 10)).foregroundStyle(.secondary)
+                            }
+                            HStack(spacing: 4) {
+                                Circle().fill(Color.orange).frame(width: 6, height: 6)
+                                Text("Overpass").font(.system(size: 10)).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+                    .padding(10)
+                    .background {
+                        RoundedRectangle(cornerRadius: RAAHTheme.Radius.sm)
+                            .fill(Color.white.opacity(0.05))
+                    }
+                }
+
+                Divider().opacity(0.2)
+
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Short-term")
@@ -301,9 +367,9 @@ struct SettingsView: View {
                             .font(RAAHTheme.Typography.caption())
                             .foregroundStyle(.secondary)
                     }
-                    
+
                     Spacer()
-                    
+
                     Button("Clear") {
                         appState.shortTermMemory.clear()
                         HapticEngine.light()
@@ -409,6 +475,7 @@ struct SettingsView: View {
                 Text("Your AI companion for the physical world. Turning every walk into a conversation worth having.")
                     .font(RAAHTheme.Typography.caption())
                     .foregroundStyle(.secondary)
+
             }
         }
     }
@@ -458,6 +525,56 @@ struct SettingsView: View {
                         .font(RAAHTheme.Typography.caption())
                         .foregroundStyle(.tertiary)
                 }
+            }
+        }
+    }
+
+    // MARK: - Budget
+
+    private let budgetOptions: [(label: String, value: String, icon: String, hint: String)] = [
+        ("Any", "", "💰", "No preference"),
+        ("Budget", "₹ (budget/cheap)", "₹", "Street food & cheap eats"),
+        ("Moderate", "₹₹ (moderate)", "₹₹", "Mid-range restaurants"),
+        ("Upscale", "₹₹₹+ (upscale/fine dining)", "₹₹₹", "Fine dining & premium"),
+    ]
+
+    private var budgetSection: some View {
+        GlassCard {
+            VStack(spacing: 16) {
+                sectionTitle("BUDGET PREFERENCE")
+
+                HStack(spacing: 10) {
+                    ForEach(budgetOptions, id: \.value) { opt in
+                        let isSelected = appState.budgetPreference == opt.value
+                        Button {
+                            appState.budgetPreference = opt.value
+                            HapticEngine.selection()
+                        } label: {
+                            VStack(spacing: 4) {
+                                Text(opt.icon)
+                                    .font(.system(size: 16))
+                                Text(opt.label)
+                                    .font(RAAHTheme.Typography.caption(.medium))
+                                    .foregroundStyle(isSelected ? .primary : .secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background {
+                                RoundedRectangle(cornerRadius: RAAHTheme.Radius.md)
+                                    .fill(isSelected ? appState.accentColor.opacity(0.2) : Color.white.opacity(0.06))
+                            }
+                            .overlay {
+                                RoundedRectangle(cornerRadius: RAAHTheme.Radius.md)
+                                    .strokeBorder(isSelected ? appState.accentColor : Color.white.opacity(0.1), lineWidth: 1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Text("AI will filter recommendations by price tier")
+                    .font(RAAHTheme.Typography.caption())
+                    .foregroundStyle(.tertiary)
             }
         }
     }

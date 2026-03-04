@@ -18,7 +18,7 @@ final class SpatialCache {
     private let queue = DispatchQueue(label: "com.raah.spatialcache", attributes: .concurrent)
 
     // TTLs in seconds
-    private let poiTTL: TimeInterval = 7 * 24 * 3600       // 7 days
+    private let poiTTL: TimeInterval = 4 * 3600             // 4 hours (restaurants change, keep fresh)
     private let wikiTTL: TimeInterval = 30 * 24 * 3600      // 30 days
     private let weatherTTL: TimeInterval = 3600              // 1 hour
     private let geocodeTTL: TimeInterval = 7 * 24 * 3600    // 7 days
@@ -41,12 +41,13 @@ final class SpatialCache {
     // MARK: - POI Cache (by geohash)
 
     func cachedPOIs(coordinate: CLLocationCoordinate2D) -> [POI]? {
-        let key = "pois_\(geohash(coordinate, precision: 6))"
+        // v2: bumped when Google Places was added to pipeline — busts all old Overpass-only cache entries
+        let key = "pois_v2_\(geohash(coordinate, precision: 6))"
         return load(key: key, type: [POI].self, ttl: poiTTL)
     }
 
     func cachePOIs(_ pois: [POI], coordinate: CLLocationCoordinate2D) {
-        let key = "pois_\(geohash(coordinate, precision: 6))"
+        let key = "pois_v2_\(geohash(coordinate, precision: 6))"
         save(key: key, value: pois)
     }
 

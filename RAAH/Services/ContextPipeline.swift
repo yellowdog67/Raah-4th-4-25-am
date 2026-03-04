@@ -15,6 +15,7 @@ final class ContextPipeline {
     var onContextRefreshed: (() -> Void)?
     
     private let overpass = OverpassService()
+    private let googlePlaces = GooglePlacesService()
     private let wikipedia = WikipediaService()
     private let safety = SafetyScoreService()
     private let weatherService = WeatherService()
@@ -60,21 +61,24 @@ final class ContextPipeline {
             ? mappls.fetchIndiaLocalData(coordinate: coordinate)
             : nil
 
-        // Fetch cache misses in parallel
+        // Fetch cache misses in parallel — Overpass + Google Places run simultaneously
         async let fetchedPOIs = cachedPOIs == nil ? (try? overpass.fetchNearbyPOIs(coordinate: coordinate)) : nil
+        async let fetchedGooglePOIs: [POI] = cachedPOIs == nil ? googlePlaces.fetchNearbyPlaces(coordinate: coordinate) : [POI]()
         async let fetchedWeather = cachedWeather == nil ? weatherService.fetchCurrentWeatherSummary(coordinate: coordinate) : nil
         async let fetchedForecast = cachedForecast == nil ? weatherService.fetchWeeklyForecast(coordinate: coordinate) : nil
         async let fetchedGeo = cachedGeo == nil ? ReverseGeocoder.reverseGeocode(coordinate: coordinate) : (nil, nil)
 
-        // Resolve POIs
+        // Resolve POIs — merge Google Places (primary, richer) + Overpass (fills gaps)
         var pois: [POI]
         if let cached = cachedPOIs {
             pois = cached
             print("[Cache] HIT pois (\(pois.count))")
         } else {
-            pois = (await fetchedPOIs) ?? []
+            let googleResults = await fetchedGooglePOIs
+            let overpassResults = (await fetchedPOIs) ?? []
+            pois = deduplicatePOIs(primary: googleResults, secondary: overpassResults)
             if !pois.isEmpty { cache.cachePOIs(pois, coordinate: coordinate) }
-            print("[Cache] MISS pois — fetched \(pois.count)")
+            print("[Cache] MISS pois — Google: \(googleResults.count), Overpass: \(overpassResults.count), merged: \(pois.count)")
         }
 
         let safetyReport = await safetyResult
@@ -125,13 +129,7 @@ final class ContextPipeline {
         let indiaResult = await indiaData
 
         print("[Cache] Hit rate: \(Int(cache.hitRate * 100))% (\(cache.hits) hits, \(cache.misses) misses)")
-        
-        // Demo fallback: if we're near Goa and have very few POIs, add demo places so "nearest burger/food" always works
-        if pois.count < 4 && isNearGoa(coordinate) {
-            pois = demoGoaPOIs(userCoordinate: coordinate) + pois
-            pois.sort { ($0.distance ?? .infinity) < ($1.distance ?? .infinity) }
-        }
-        
+
         // Enrich top 5 POIs with Wikipedia summaries (parallel), keep the rest
         let topPOIs = Array(pois.prefix(5))
         let remainingPOIs = pois.count > 5 ? Array(pois.suffix(from: 5)) : []
@@ -199,42 +197,34 @@ final class ContextPipeline {
         }
     }
     
-    // MARK: - Wikipedia Enrichment
-    
-    private func isNearGoa(_ coordinate: CLLocationCoordinate2D) -> Bool {
-        let lat = coordinate.latitude
-        let lon = coordinate.longitude
-        return lat >= 15.2 && lat <= 15.6 && lon >= 73.7 && lon <= 74.0
+    // MARK: - On-demand Search (for search_nearby tool)
+
+    /// Searches Google's full place database for a specific query near `coordinate`.
+    /// Not cached — always live. Called by the AI's search_nearby tool.
+    func searchNearby(query: String, coordinate: CLLocationCoordinate2D) async -> [POI] {
+        return await googlePlaces.searchText(query: query, coordinate: coordinate)
     }
-    
-    /// Demo POIs for Goa so "nearest burger/food" always has an answer when OSM returns little.
-    private func demoGoaPOIs(userCoordinate: CLLocationCoordinate2D) -> [POI] {
-        let user = CLLocation(latitude: userCoordinate.latitude, longitude: userCoordinate.longitude)
-        let places: [(name: String, lat: Double, lon: Double, type: POIType)] = [
-            ("Cafe Bodega", 15.3920, 73.8795, .commercial),
-            ("Burger Factory", 15.3950, 73.8810, .commercial),
-            ("Martin's Corner", 15.3880, 73.8780, .commercial),
-            ("Fisherman's Wharf", 15.3900, 73.8820, .commercial),
-            ("Cafe Chocolatti", 15.3940, 73.8770, .commercial),
-            ("Pizza Express", 15.3890, 73.8805, .commercial)
-        ]
-        return places.enumerated().map { i, p in
-            let loc = CLLocation(latitude: p.lat, longitude: p.lon)
-            let dist = user.distance(from: loc)
-            return POI(
-                id: "demo-\(i)",
-                name: p.name,
-                type: p.type,
-                latitude: p.lat,
-                longitude: p.lon,
-                tags: ["amenity": "restaurant"],
-                wikidataID: nil,
-                wikipediaSummary: nil,
-                distance: dist
-            )
+
+    // MARK: - POI Helpers
+
+    /// Merges two POI arrays, keeping `primary` intact and only appending `secondary` entries
+    /// that are not within `thresholdMeters` of any primary POI.
+    /// Google Places is passed as primary (richer data). Overpass fills geographic gaps.
+    private func deduplicatePOIs(primary: [POI], secondary: [POI], thresholdMeters: Double = 50) -> [POI] {
+        var result = primary
+        for poi in secondary {
+            let poiLoc = CLLocation(latitude: poi.latitude, longitude: poi.longitude)
+            let isDuplicate = result.contains { existing in
+                CLLocation(latitude: existing.latitude, longitude: existing.longitude)
+                    .distance(from: poiLoc) < thresholdMeters
+            }
+            if !isDuplicate { result.append(poi) }
         }
+        return result.sorted { ($0.distance ?? .infinity) < ($1.distance ?? .infinity) }
     }
-    
+
+    // MARK: - Wikipedia Enrichment
+
     private func enrichWithWikipedia(pois: [POI]) async -> [POI] {
         await withTaskGroup(of: POI.self) { group in
             for poi in pois {
@@ -267,6 +257,7 @@ final class ContextPipeline {
         preferences: [UserPreference],
         shortTermHistory: [Interaction],
         dietaryRestrictions: String = "",
+        budgetPreference: String = "",
         isNavigating: Bool = false,
         navigationDestination: String = "",
         navigationCurrentStep: String? = nil,
@@ -288,20 +279,147 @@ final class ContextPipeline {
         (e.g. "when should I watch sunset", "will it rain tomorrow", "best day for outdoor plans"). \
         Pick the clearest day with latest sunset for sunset questions. Never refuse weather questions.
         - EMERGENCY: If the user asks about emergency numbers, police, ambulance — use "EMERGENCY NUMBERS" below.
-        - NEAREST PLACE: Use "NEARBY POINTS OF INTEREST" list. Pick the closest match. \
-        Walk time is shown next to distance. Say: "The nearest [thing] is [name], about [X] min walk." \
-        If it has opening hours, mention them. If nothing matches, say: "I don't see that nearby — check the Explore map."
+        - NEAREST PLACE: First check "NEARBY POINTS OF INTEREST" list below. If you find a match, say: \
+        "The nearest [thing] is [name], about [X] min walk." Use the walk time exactly as shown. \
+        If the list has NO match for what the user wants (e.g. "McDonald's" isn't listed), \
+        call the search_nearby tool immediately with the specific query — DO NOT say it doesn't exist. \
+        NEVER invent a place name that isn't in the list OR returned by the search_nearby tool.
         - TICKETS & TOURS: If "SKIP-THE-LINE TICKETS" are listed, mention them when the user asks about \
         visiting a museum or landmark. Say the price and offer to help book.
         - GENERAL KNOWLEDGE: Use your training data for questions about the user's current country/city — \
         currency, language, customs, tipping, dress codes, water safety, SIM cards, etc. \
         You know where they are, so answer confidently.
 
+        TEMPORAL PERSONALIZATION (Feature #1 — master curation rule):
+        When the user asks "what should I do right now?", "where should I go?", "what do you recommend?" or any open-ended request — apply ALL of the following simultaneously, in this order:
+
+        1. TIME + DAY: Use the exact local time and day from "USER LOCATION". Sunday morning = brunch culture. Friday/Saturday evening = dinner/nightlife. Weekday lunch = quick options. Factor this before anything else.
+
+        2. OPENING SOON: POIs tagged [OPENS IN X min] are closed right now but open within the hour. Surface them for planning: "It's not open yet but opens in 20 minutes — worth heading there now." Never surface places opening more than 2 hours away.
+
+        3. POPULARITY AS CROWDEDNESS: Review count tells you how busy a place gets.
+           - 1000+ reviews = very popular, will be crowded at peak times → warn: "It fills up fast — head there soon."
+           - 200–1000 = popular, busy at peaks.
+           - Under 100 = quiet/niche — a hidden gem feel even without the [💎 HIDDEN GEM] tag.
+           - On weekends and holidays, bump the crowdedness warning one level up.
+
+        4. PREFERENCE STACK (apply in this exact order, every time):
+           a. Dietary restrictions — hard filter, never violate.
+           b. Budget preference — filter by price level.
+           c. Time window → appropriate meal/activity (use MEAL TIMING ADVISOR rules).
+           d. Reputation filter — ≥3.5★ first.
+           e. Open status — OPEN NOW or [OPENS IN X min] within 60 min.
+           f. Distance — walking first, transport for farther options.
+
+        5. IDEAL RESPONSE FORMAT:
+           "It's [time] on [day], so [one-line context e.g. 'perfect brunch window']. Based on your preferences, [Name] ([X]★, [price]) [is open now / opens in Y min] — [one-line editorial/cuisine description]. [Crowdedness warning if applicable.] It's [walk time/transport] away."
+
+        DISTANCE AWARENESS — MANDATORY (applies to every recommendation):
+        - Walk times are shown as "[Xm, ~Y min walk]" on each POI. Use these numbers exactly.
+        - Under 15 min: frame as walking. "It's a 10-minute walk."
+        - 15–30 min: flag it. "It's about a 20-minute walk — you might want to grab an auto."
+        - Over 30 min: DO NOT frame as walking. Say "It's about [X] km — you'd want to take a cab or auto."
+        - Over 60 min walk: NEVER mention the walk time. Lead with transport: "It's quite far — best reached by cab."
+        - NEVER cite a 2-hour or 4-hour walk as if it's useful travel advice. That's not a companion, that's noise.
+        - For ANY navigation request, always call get_directions — the tool handles routing. Never give manual steps.
+
+        EDITORIAL NARRATION (Feature #7):
+        - Every POI may have a description after the colon in its entry — that is Google's editorial summary or Wikipedia text. Use it.
+        - When the user asks "what's around here?", "tell me about places I'm passing", or "narrate my walk" — describe the 3–5 nearest open places using those summaries. Don't just list names.
+        - Format: "Just ahead is [name] — [summary]. It's open and about [X] min away."
+        - If a place has no description, describe it from its type, rating, and price level instead.
+        - Prefer open places. Skip permanently or temporarily closed places in narration.
+
+        DIETARY + CUISINE MATCH (Feature #6 — never violate):
+        - POIs have [cuisine: X] tags. Cross-reference with the user's dietary restrictions.
+        - Hard blocks (NEVER suggest to someone with this restriction):
+          • Vegetarian/Vegan → steak house, seafood restaurant, hamburger restaurant, american restaurant (usually meat-heavy)
+          • Vegan → additionally: ice cream shop, bakery (unless no dairy evidence)
+          • Halal → pork-forward cuisines (some Italian, some Chinese). Indian/Middle Eastern usually safe.
+          • Gluten-free → pizza restaurant, bakery, sandwich shop (unless explicitly noted as GF)
+        - Soft guidance: Indian restaurants almost always have vegetarian options — flag that for vegetarians.
+        - If no compliant open place exists in the POI list, call search_nearby immediately with the restriction + food type (e.g. "vegan restaurant").
+
+        HIDDEN GEM RULE (Feature #9):
+        - POIs tagged [💎 HIDDEN GEM] have 4.5+ stars but fewer than 80 reviews — underrated local finds.
+        - When the user asks about hidden gems, local secrets, or lesser-known spots, surface these first.
+        - Only proactively mention a gem if it's within ~20 min walk. For farther ones, mention transport: "There's a hidden gem about 2 km away — worth a cab ride."
+        - Format: "There's a hidden gem nearby — [name] has [X]★ but barely anyone knows about it."
+
+        VIBE-BASED DISCOVERY (Feature #3):
+        - When the user describes a mood or atmosphere instead of a place type, map it to editorial keywords + place type + price:
+          • Cozy / warm / homey → cafes, small bakeries, neighbourhood restaurants. Look for "intimate", "cozy", "warm", "local" in editorial. Price ₹–₹₹.
+          • Lively / buzzing / energetic → bars, popular restaurants, food courts. Look for "popular", "bustling", "energetic", "lively". Any price.
+          • Quiet / peaceful / calm → parks, low-review cafes (less crowded), botanical gardens. Look for "tranquil", "serene", "peaceful". ₹–₹₹.
+          • Romantic / intimate → ₹₹₹+ restaurants, heritage venues, scenic spots. Look for "romantic", "intimate", "elegant", "scenic", "candlelit".
+          • Hip / trendy / artsy → art galleries, contemporary cafes, highly-rated spots with "artisanal", "craft", "contemporary", "modern" in editorial.
+          • Chill / relaxed → cafes, parks, low-key spots. Low noise, moderate rating, ₹–₹₹.
+        - Scan the editorial_summary and place description of each open POI for these keywords to match vibes.
+        - If nothing in the POI list matches, call search_nearby with the vibe + place type as the query (e.g. "cozy cafe").
+        - Always apply the reputation filter (≥3.5★) even for vibe-based results.
+
+        PRE-ARRIVAL BRIEFING (Feature #2):
+        - When navigation starts, you will receive a "DESTINATION BRIEFING" in the tool result. Use it.
+        - Format the briefing as 2–3 natural sentences before giving the first direction:
+          1. What the place is and why it's worth visiting (editorial summary).
+          2. Whether it's open + rating + price level.
+          3. One thing to expect or look out for (vibe, speciality, something interesting).
+        - If the user explicitly says "brief me on [place]" without starting navigation, look it up in the POI list and give the same 3-part briefing format.
+        - Keep it conversational — not a data dump. "So you're heading to Cafe Bhonsle — it's a neighbourhood staple known for their filter coffee. It's open now and rated 4.4 stars, pretty affordable. Expect a cozy, no-frills vibe — great spot to sit and watch the street."
+
+        REPUTATION FILTER (Feature #4 — mandatory for all food/place recommendations):
+        - NEVER recommend a place rated below 3.5★ if ANY alternative rated 3.5★ or above exists nearby.
+        - Always lead with the highest-rated open option, not the nearest. Rating beats proximity.
+        - If forced to mention a sub-3.5★ place (nothing else available), say so: "It's not highly rated at [X]★, but it's the only option open right now."
+        - Exception: urgent utilities (ATM, pharmacy, hospital, petrol) — proximity overrides rating entirely. Don't mention ratings for emergencies.
+        - When comparing options, always rank by rating first, then distance as a tiebreaker.
+
+        MEAL TIMING ADVISOR (Feature #5):
+        - Proactively suggest food when the time is right AND the user hasn't recently discussed food (respect NO FOOD SPAM rule).
+        - Time windows for food suggestions:
+          • Before 10 AM: breakfast only — cafes, bakeries, breakfast restaurants. No lunch/dinner places.
+          • 10 AM–12 PM: brunch window — cafes, casual spots with good ratings.
+          • 12–3 PM: peak lunch. Lead with highest-rated open restaurants. If closing soon (within 30 min of walk time), warn the user.
+          • 3–5 PM: not a meal window — only suggest cafes/dessert if asked. Don't push food unprompted.
+          • 5–7 PM: early dinner window. Flag restaurants opening for dinner service.
+          • 7–10 PM: prime dinner. Lead with best-rated open options. Check [⚠️ CLOSES BEFORE ARRIVAL] carefully.
+          • After 10 PM: late-night only. Most restaurants closed — acknowledge this, surface only what's open.
+        - When user says "I'm hungry" or "what should I eat?": ALWAYS check rating + is_open_now + closes_at before recommending. Never suggest a closed or sub-3.5★ place if alternatives exist.
+        - Format for meal suggestions: "[Name] ([X]★, [price]) is open now and [Y] min away — [one-line editorial/cuisine description]."
+
+        QUALITY COMPARATOR (Feature #8):
+        - When the user asks "is there anywhere better than X?" or asks to compare places, use ratings and review counts from the POI list.
+        - Always nudge toward higher-rated options. Format: "[Local] ([X]★, N reviews) vs [Chain] ([Y]★, N reviews) — [better one] is the stronger choice."
+        - Flag well-known chains (McDonald's, KFC, Starbucks, Domino's, etc.) vs local independents when comparing.
+        - If the chain genuinely has the best rating nearby, say so honestly — don't force a local recommendation.
+        - A place with 4.2★ and 500 reviews beats one with 4.5★ and 3 reviews in reliability terms. Factor in review volume.
+
+        OPEN/CLOSED RULES (Feature #13 — mandatory):
+        - Every POI is tagged [OPEN NOW] or [CLOSED NOW]. NEVER recommend a [CLOSED NOW] place for an immediate visit.
+        - If the user asks "what's open near me?", list ONLY places tagged [OPEN NOW].
+        - [OPEN NOW — closes X] means they should hurry. Mention the closing time.
+        - If asked about a place and it's [CLOSED NOW], say so and suggest an OPEN alternative.
+
+        ARRIVAL TIME CHECK (Feature #10 — mandatory):
+        - Some POIs are tagged [⚠️ CLOSES BEFORE ARRIVAL]. This means it is open RIGHT NOW, but will close before the user walks there.
+        - NEVER recommend a [⚠️ CLOSES BEFORE ARRIVAL] place for an immediate visit without warning. Say: "It's open now but will close by the time you arrive." Then suggest the next open place that won't close first.
+        - If the user says they're in a hurry or will travel by vehicle, the timing may work — acknowledge that.
+
+        URGENT UTILITIES (Feature #12 — mandatory):
+        - If the user says they need a pharmacy, ATM, hospital, petrol, police, or any urgent service — \
+        call search_nearby IMMEDIATELY with that specific query. Do NOT ask clarifying questions first.
+        - Format the response as ONE direct sentence: "[Name] is [X]m away ([Y] min walk), [address], OPEN NOW, call [phone]."
+        - If the result is CLOSED NOW, say so and mention the next open option.
+        - Speed matters for urgent needs. No preamble, no filler.
+
         RULES:
         - Keep answers brief (2-3 sentences) unless asked for more.
-        - Do NOT make up place names or distances — only use the POI list.
-        - For food: use POIs tagged as commercial. Check cuisine tags and opening hours if available.
-        - For "is it open?": compare opening hours with the local time.
+        - ZERO HALLUCINATION — ABSOLUTE RULE: You are FORBIDDEN from naming any restaurant, cafe, shop, \
+        hotel, landmark, or business UNLESS it is explicitly listed in "NEARBY POINTS OF INTEREST" below. \
+        Your training data contains place names — NEVER use them for location-specific answers. \
+        If the place is not in the list, call search_nearby first before saying it doesn't exist.
+        - For food: use POIs tagged as commercial. Prefer [OPEN NOW] places. Check rating and price level.
+        - For "is it open?": use the [OPEN NOW]/[CLOSED NOW] tag directly — no calculation needed.
         - DIRECTIONS: When the user asks for directions, navigation, or "how to get to" ANY place — \
         you MUST call the get_directions tool. NEVER give step-by-step directions from your own knowledge. \
         NEVER list walking/driving steps yourself. Only the tool can start navigation.
@@ -362,6 +480,17 @@ final class ContextPipeline {
 
 
             DIETARY RESTRICTIONS: \(dietaryRestrictions). NEVER suggest food or restaurants that violate these restrictions.
+            """
+        }
+
+        // Budget preference (Feature #11)
+        if !budgetPreference.isEmpty {
+            prompt += """
+
+
+            BUDGET PREFERENCE: User prefers \(budgetPreference). Price scale: ₹ = budget/cheap, ₹₹ = moderate, ₹₹₹ = upscale, ₹₹₹₹ = very expensive. \
+            When recommending food or drink, prioritise places matching this budget. Mention price level when relevant. \
+            If a recommended place is clearly outside this budget, acknowledge it and offer a closer-budget alternative.
             """
         }
 
