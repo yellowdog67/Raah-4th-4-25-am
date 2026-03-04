@@ -685,17 +685,6 @@ struct SpatialContext {
                 if let price = poi.tags["price_level"] { meta.append(price) }
                 if !meta.isEmpty { desc += " [\(meta.joined(separator: ", "))]" }
 
-                // Problem 1 fix: tag utility POIs so narration rule can skip them
-                let utilityTypes: Set<String> = [
-                    "atm", "bank", "gas_station", "pharmacy", "drugstore",
-                    "convenience_store", "supermarket", "grocery_store",
-                    "bus_station", "train_station", "subway_station",
-                    "car_rental", "airport", "parking", "hospital", "doctor"
-                ]
-                if let primaryType = poi.tags["primary_type"], utilityTypes.contains(primaryType) {
-                    desc += " [UTILITY — silent unless asked or user showed intent]"
-                }
-
                 // Feature #9: Hidden gem — high rating, few reviews
                 if let ratingStr = poi.tags["rating"],
                    let rating = Double(ratingStr), rating >= 4.5,

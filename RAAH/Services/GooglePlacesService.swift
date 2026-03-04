@@ -230,24 +230,10 @@ final class GooglePlacesService {
                             let hoursOnly = String(line[line.index(after: colon)...])
                                 .trimmingCharacters(in: .whitespaces)
                             tags["today_hours"] = hoursOnly
-                            if hoursOnly.lowercased().contains("24 hours") {
-                                tags["opens_at"]  = "12:00 AM"
-                                tags["closes_at"] = "11:59 PM"
-                            } else if hoursOnly.lowercased() != "closed" {
-                                // Try separators in priority order: en-dash, em-dash, plain hyphen
-                                let separators = [" \u{2013} ", " \u{2014} ", " - ", "\u{2013}", "\u{2014}", "-"]
-                                for sep in separators {
-                                    let parts = hoursOnly.components(separatedBy: sep)
-                                    if parts.count == 2 {
-                                        let open  = parts[0].trimmingCharacters(in: .whitespaces)
-                                        let close = parts[1].trimmingCharacters(in: .whitespaces)
-                                        if !open.isEmpty && !close.isEmpty {
-                                            tags["opens_at"]  = open
-                                            tags["closes_at"] = close
-                                            break
-                                        }
-                                    }
-                                }
+                            let parts = hoursOnly.components(separatedBy: " – ")
+                            if parts.count == 2 {
+                                tags["opens_at"] = parts[0].trimmingCharacters(in: .whitespaces)
+                                tags["closes_at"] = parts[1].trimmingCharacters(in: .whitespaces)
                             }
                         }
                     }
